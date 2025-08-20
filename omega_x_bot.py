@@ -126,10 +126,11 @@ BACKOFF_BASE = 1.5
 BACKOFF_MAX = 30.0
 HTTP_TIMEOUT = 10
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+# --- FIX: Hardcoded for debugging - THIS IS INSECURE AND MUST BE REMOVED AFTER TESTING ---
+TELEGRAM_TOKEN = "8384498061:AAElt7HeM88jfune948IcKkysHpw1tmXrlc"  # Replace with your NEW token
+TELEGRAM_CHAT_ID = "1040990874" # Replace with your verified Chat ID
+# ------------------------------------------------------------------------------------
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
-TELEGRAM_MIN_INTERVAL = 0.8
 
 PORT = int(os.environ.get("PORT", "10000"))
 STATE_FILE = "state.json"
@@ -586,7 +587,11 @@ class MetaPolicy:
 
 
 def sig01(x: float) -> float:
-    return float(1.0 / (1.0 + np.exp(-x)))
+    # Use a try-except block to handle potential OverflowError
+    try:
+        return float(1.0 / (1.0 + np.exp(-x)))
+    except OverflowError:
+        return 0.0 if x < 0 else 1.0
 
 
 def clamp01(x: float) -> float:
@@ -693,8 +698,7 @@ class Strategy:
 
     def strength_donchian(self, px, don_hi, don_lo, atr):
         return clamp01((px - don_hi) / (atr + 1e-9)), clamp01((don_lo - px) / (atr + 1e-9))
-
-    # <<< FIX STARTS HERE >>>
+    
     def alpha_scores(self, symbol, df5, df15, df1h, btc_df, cs_rank, funding_rate):
         f = self.features(df5, df15, df1h)
         px = float(df5["close"].iloc[-1])
@@ -736,7 +740,7 @@ class Strategy:
             "xsmom": (lxs, sxs),
             "carry": (cr_l, cr_s),
         }
-    # <<< FIX ENDS HERE >>>
+
 
 class PortfolioManager:
     def __init__(self, bot: "OmegaXBot"):
@@ -1545,6 +1549,8 @@ class OmegaXBot:
                 try:
                     self._drain_events()
 
+                    self.engine.tick_repair(self.positions, self.risk, self.notifier, hedge_book=self.hedger.snapshot())
+                    
                     self.data.schedule_updates(MAX_KLINE_UPDATES_PER_LOOP)
                     self.prices.update_next()
                     self.funding.maybe_update()
