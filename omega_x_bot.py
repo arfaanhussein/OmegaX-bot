@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-OmegaX Futures Bot (Paper by default, LIVE-ready)
+OmegaX Futures Bot (Paper by default, LIVE-ready) - Thread-safe edition
 - Python 3.13.4
 - Exchange: Binance USDT-M Futures (ccxt REST; python-binance user WS for fills)
-- Core: Bandit meta-allocator across multiple alphas + carry tilt
-Key features and fixes:
-- Native SL/TP brackets at entry; cancel&replace on any update
-- Bracket repair loop + safety flatten if brackets can’t be placed
-- Private user WebSocket for order fills => resolves cancel/replace race
-- Sync live open orders on startup to restore bracket IDs
-- Overlay hedge and per-trade temp hedges are separate logical entities; reconciled to net BTC hedge
-- Peak-equity DD + graceful flatten; closed-candle signals; continuous strengths
-- Telegram notifications on every trade/hedge/repair
+- Concurrency safety:
+  - Single-writer event queue: WS thread only enqueues; main thread mutates state
+  - Global RLock guards state access (positions, risk, hedge book)
+  - Flask endpoints read snapshots under lock
+- Execution:
+  - Native SL/TP brackets at entry; cancel&replace on updates
+  - Bracket repair loop + safety flatten
+  - WS fills reconciliation to resolve cancel/replace race
+  - Live open orders sync on startup
+- Strategy:
+  - Bandit meta-allocator across alphas; closed-candle signals; continuous strengths
+- Hedging:
+  - Overlay hedge (beta) + per-trade temp hedges kept as separate logical books, reconciled to a single BTC hedge
+- Telegram updates on every trade/hedge/repair event
 
 Env:
   MODE = paper|live
@@ -31,9 +36,11 @@ import json
 import random
 import logging
 import threading
+from threading import RLock
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
+from queue import Queue, Empty
 
 import numpy as np
 import pandas as pd
@@ -46,7 +53,7 @@ from ta.volatility import BollingerBands, AverageTrueRange
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volume import VolumeWeightedAveragePrice
 
-# Optional: private user WS (only used in live)
+# Optional user WS (only used in live)
 try:
     from binance.streams import ThreadedWebsocketManager
     BINANCE_WS_AVAILABLE = True
@@ -721,8 +728,10 @@ class Portfolio:
         self.bot = bot
 
     def exposure(self) -> Dict[str, float]:
-        res = {}
-        for p in self.bot.positions.values():
+        with self.bot.lock:
+            items = list(self.bot.positions.items())
+        res: Dict[str, float] = {}
+        for _, p in items:
             if not p or p.is_hedge:
                 continue
             price = self.bot.prices.get(p.symbol, self.bot.data.get(p.symbol, "5m"))
@@ -737,25 +746,39 @@ class Portfolio:
         for b, members in self.BUCKETS.items():
             for s in members:
                 totals[b] += e.get(s, 0.0)
-        bal = self.bot.risk.balance
+        with self.bot.lock:
+            bal = self.bot.risk.balance
         for b, v in totals.items():
             if abs(v) > self.BUCKET_MAX_FRAC[b] * bal:
                 return b
         return None
 
 
+@dataclass
+class OrderEvent:
+    symbol: str
+    ord_type: str
+    status: str
+    side: str
+    order_id: str
+    avg_price: float
+    reduce_only: bool
+
+
 class ExecutionEngine:
-    """Execution with native brackets, cancel/replace, repair, and order sync."""
-    def __init__(self, mode: str, ex_wrapper: Optional[ExchangeWrapper], persistence: Persistence, notifier: Notifier):
+    """Execution with native brackets, cancel/replace, repair, and order sync; lock guarded state."""
+    def __init__(self, mode: str, ex_wrapper: Optional[ExchangeWrapper], persistence: Persistence, notifier: Notifier, lock: RLock):
         self.mode = mode
         self.exw = ex_wrapper
         self.persistence = persistence
         self.notifier = notifier
+        self.lock = lock
         self.pending_intents: List[dict] = []
         self.repair_tasks: Dict[str, dict] = {}
 
     def _persist(self, risk, positions, hedge_book=None):
-        self.persistence.save(risk, positions, pending=self.pending_intents, hedge_book=hedge_book or {})
+        with self.lock:
+            self.persistence.save(risk, positions, pending=self.pending_intents, hedge_book=hedge_book or {})
 
     def _parse_fill(self, order) -> Tuple[Optional[float], Optional[float], Optional[str]]:
         if not order:
@@ -825,42 +848,45 @@ class ExecutionEngine:
         symbol, side, qty, entry, sl, tp, lev, mode, tag = intent
         now = time.time()
         if self.mode == Mode.PAPER:
-            positions[symbol] = Position(symbol, side, qty, entry, sl, tp, lev, now, mode=mode, tag=tag)
+            with self.lock:
+                positions[symbol] = Position(symbol, side, qty, entry, sl, tp, lev, now, mode=mode, tag=tag)
             notifier.send(f"{symbol}: 🚀 OPEN {mode}/{tag} {side.upper()} qty={qty:.6f} @ {entry:.4f} SL={sl:.4f} TP={tp:.4f} lev={lev}x")
             self._persist(risk, positions, hedge_book)
             return True
         try:
             client_id = f"ox-{int(time.time()*1000)}-{random.randint(100,999)}"
-            self.pending_intents.append({
-                "symbol": symbol, "side": side, "qty": qty, "sl": sl, "tp": tp,
-                "lev": lev, "mode": mode, "tag": tag, "clientOrderId": client_id, "ts": now
-            })
+            with self.lock:
+                self.pending_intents.append({
+                    "symbol": symbol, "side": side, "qty": qty, "sl": sl, "tp": tp,
+                    "lev": lev, "mode": mode, "tag": tag, "clientOrderId": client_id, "ts": now
+                })
             self._persist(risk, positions, hedge_book)
             order = self.exw.ex.create_order(
-                symbol, type="market",
-                side=("buy" if side == "long" else "sell"),
-                amount=qty,
-                params={"newClientOrderId": client_id}
+                symbol, type="market", side=("buy" if side == "long" else "sell"),
+                amount=qty, params={"newClientOrderId": client_id}
             )
             avg, filled, order_id = self._parse_fill(order)
             avg = avg or entry
             q = filled or qty
-            positions[symbol] = Position(symbol, side, q, float(avg), sl, tp, lev, now, mode=mode, tag=tag,
-                                         entry_order_id=order_id, client_order_id=client_id)
-            # skip brackets for hedges
+            with self.lock:
+                positions[symbol] = Position(symbol, side, q, float(avg), sl, tp, lev, now, mode=mode, tag=tag,
+                                             entry_order_id=order_id, client_order_id=client_id)
             if mode in ("hedge", "temp_hedge"):
                 notifier.send(f"{symbol}: ✅ LIVE OPEN {mode}/{tag} {side.upper()} qty={q:.6f} @ {avg:.4f}")
             else:
                 sl_id, tp_id = self._place_brackets(symbol, side, q, sl, tp)
-                positions[symbol].sl_order_id = sl_id
-                positions[symbol].tp_order_id = tp_id
+                with self.lock:
+                    pos = positions.get(symbol)
+                    if pos:
+                        pos.sl_order_id = sl_id
+                        pos.tp_order_id = tp_id
                 if not sl_id or not tp_id:
-                    self.repair_tasks[symbol] = {
-                        "side": side, "qty": q, "sl": sl, "tp": tp, "attempts": 0, "next_try": time.time() + 3
-                    }
+                    with self.lock:
+                        self.repair_tasks[symbol] = {"side": side, "qty": q, "sl": sl, "tp": tp, "attempts": 0, "next_try": time.time() + 3}
                     notifier.send(f"{symbol}: ⚠️ Bracket placement incomplete. Repair scheduled.")
                 notifier.send(f"{symbol}: ✅ LIVE OPEN {mode}/{tag} {side.upper()} qty={q:.6f} @ {avg:.4f} SL={sl:.4f} TP={tp:.4f} lev={lev}x")
-            self.pending_intents = [p for p in self.pending_intents if p.get("clientOrderId") != client_id]
+            with self.lock:
+                self.pending_intents = [p for p in self.pending_intents if p.get("clientOrderId") != client_id]
             self._persist(risk, positions, hedge_book)
             return True
         except Exception as e:
@@ -868,30 +894,38 @@ class ExecutionEngine:
             return False
 
     def replace_brackets(self, symbol: str, positions, new_qty: float, new_sl: float, new_tp: float, risk, notifier, hedge_book=None):
-        p = positions.get(symbol)
+        with self.lock:
+            p = positions.get(symbol)
         if not p:
             return
-        # do not place brackets for hedges
         if p.mode in ("hedge", "temp_hedge"):
             return
-        p.sl = new_sl
-        p.tp = new_tp
-        self._cancel_brackets(symbol, p)
+        with self.lock:
+            p.sl = new_sl
+            p.tp = new_tp
+            self._cancel_brackets(symbol, p)
         if self.mode == Mode.PAPER:
-            p.sl_order_id = "SL-PAPER"
-            p.tp_order_id = "TP-PAPER"
+            with self.lock:
+                p.sl_order_id = "SL-PAPER"
+                p.tp_order_id = "TP-PAPER"
             self._persist(risk, positions, hedge_book)
             return
         sl_id, tp_id = self._place_brackets(symbol, p.side, new_qty, new_sl, new_tp)
-        p.sl_order_id = sl_id
-        p.tp_order_id = tp_id
+        with self.lock:
+            pos2 = positions.get(symbol)
+            if not pos2:
+                return
+            pos2.sl_order_id = sl_id
+            pos2.tp_order_id = tp_id
+            if not sl_id or not tp_id:
+                self.repair_tasks[symbol] = {"side": pos2.side, "qty": new_qty, "sl": new_sl, "tp": new_tp, "attempts": 0, "next_try": time.time() + 3}
         if not sl_id or not tp_id:
-            self.repair_tasks[symbol] = {"side": p.side, "qty": new_qty, "sl": new_sl, "tp": new_tp, "attempts": 0, "next_try": time.time() + 3}
             notifier.send(f"{symbol}: ⚠️ Bracket re-arm incomplete. Repair scheduled.")
         self._persist(risk, positions, hedge_book)
 
     def partial_close(self, symbol: str, close_qty: float, positions, risk, notifier, hedge_book=None) -> Optional[float]:
-        p = positions.get(symbol)
+        with self.lock:
+            p = positions.get(symbol)
         if not p or close_qty <= 0:
             return None
         if close_qty > p.qty:
@@ -899,28 +933,34 @@ class ExecutionEngine:
         if self.mode == Mode.PAPER:
             return None
         try:
-            res = self.exw.ex.create_order(
-                symbol, type="market", side=self._opposite(p.side), amount=close_qty, params={"reduceOnly": True}
-            )
+            res = self.exw.ex.create_order(symbol, type="market", side=self._opposite(p.side), amount=close_qty, params={"reduceOnly": True})
             avg, filled, _ = self._parse_fill(res)
             fill_qty = filled or close_qty
             t = self.exw.fetch_ticker(symbol)
             fill_price = avg or t.get("last") or t.get("close")
             pnl_part = p.dir() * fill_qty * (float(fill_price) - p.entry)
-            p.qty -= fill_qty
-            risk.update_on_close(pnl_part)
+            with self.lock:
+                pos2 = positions.get(symbol)
+                if not pos2:
+                    return pnl_part
+                pos2.qty -= fill_qty
+                risk.update_on_close(pnl_part)
             notifier.send(f"{symbol}: ↘️ Partial {fill_qty:.6f} @ {float(fill_price):.4f} pnl=${pnl_part:.2f}")
-            if p.qty > 0:
-                self.replace_brackets(symbol, positions, p.qty, p.sl, p.tp, risk, notifier, hedge_book)
+            with self.lock:
+                still = positions.get(symbol)
+            if still and still.qty > 0:
+                self.replace_brackets(symbol, positions, still.qty, still.sl, still.tp, risk, notifier, hedge_book)
             else:
-                positions[symbol] = None
+                with self.lock:
+                    positions[symbol] = None
             return pnl_part
         except Exception as e:
             logging.error(f"Partial close LIVE failed {symbol}: {e}")
             return None
 
     def add_size(self, symbol: str, add_qty: float, positions, risk, notifier, hedge_book=None):
-        p = positions.get(symbol)
+        with self.lock:
+            p = positions.get(symbol)
         if not p or add_qty <= 0:
             return
         if self.mode == Mode.PAPER:
@@ -931,47 +971,65 @@ class ExecutionEngine:
             fill_qty = filled or add_qty
             t = self.exw.fetch_ticker(symbol)
             fill_price = avg or t.get("last") or t.get("close")
-            new_qty = p.qty + fill_qty
-            p.entry = (p.entry * p.qty + float(fill_price) * fill_qty) / max(1e-9, new_qty)
-            p.qty = new_qty
-            notifier.send(f"{symbol}: ➕ Added {fill_qty:.6f} @ {float(fill_price):.4f}; new qty={p.qty:.6f}, avg={p.entry:.4f}")
-            self.replace_brackets(symbol, positions, p.qty, p.sl, p.tp, risk, notifier, hedge_book)
+            with self.lock:
+                pos2 = positions.get(symbol)
+                if not pos2:
+                    return
+                new_qty = pos2.qty + fill_qty
+                pos2.entry = (pos2.entry * pos2.qty + float(fill_price) * fill_qty) / max(1e-9, new_qty)
+                pos2.qty = new_qty
+            notifier.send(f"{symbol}: ➕ Added {fill_qty:.6f} @ {float(fill_price):.4f}; new qty={new_qty:.6f}, avg={pos2.entry:.4f}")
+            self.replace_brackets(symbol, positions, pos2.qty, pos2.sl, pos2.tp, risk, notifier, hedge_book)
         except Exception as e:
             logging.error(f"Add size LIVE failed {symbol}: {e}")
 
     def tick_repair(self, positions, risk, notifier, hedge_book=None, max_attempts: int = 6):
         now = time.time()
-        for sym, task in list(self.repair_tasks.items()):
+        with self.lock:
+            tasks = list(self.repair_tasks.items())
+        for sym, task in tasks:
             if now < task["next_try"]:
                 continue
-            p = positions.get(sym)
+            with self.lock:
+                p = positions.get(sym)
             if not p:
-                self.repair_tasks.pop(sym, None)
+                with self.lock:
+                    self.repair_tasks.pop(sym, None)
                 continue
-            # skip hedges
             if p.mode in ("hedge", "temp_hedge"):
-                self.repair_tasks.pop(sym, None)
+                with self.lock:
+                    self.repair_tasks.pop(sym, None)
                 continue
             sl_id, tp_id = self._place_brackets(sym, task["side"], task["qty"], task["sl"], task["tp"])
-            if sl_id:
-                p.sl_order_id = sl_id
-            if tp_id:
-                p.tp_order_id = tp_id
-            if p.sl_order_id and p.tp_order_id:
+            with self.lock:
+                pos2 = positions.get(sym)
+                if not pos2:
+                    self.repair_tasks.pop(sym, None)
+                    continue
+                if sl_id:
+                    pos2.sl_order_id = sl_id
+                if tp_id:
+                    pos2.tp_order_id = tp_id
+                ok = bool(pos2.sl_order_id and pos2.tp_order_id)
+                if ok:
+                    self.repair_tasks.pop(sym, None)
+            if ok:
                 notifier.send(f"{sym}: ✅ Brackets repaired.")
-                self.repair_tasks.pop(sym, None)
                 self._persist(risk, positions, hedge_book)
                 continue
-            task["attempts"] += 1
-            task["next_try"] = now + min(10, 2 + task["attempts"] * 2)
-            if task["attempts"] >= max_attempts:
-                notifier.send(f"{sym}: ❗ Brackets failed after {task['attempts']} tries. Flattening.")
+            with self.lock:
+                task_ref = self.repair_tasks.get(sym)
+                if not task_ref:
+                    continue
+                task_ref["attempts"] += 1
+                task_ref["next_try"] = now + min(10, 2 + task_ref["attempts"] * 2)
+                attempts = task_ref["attempts"]
+            if attempts >= max_attempts:
+                notifier.send(f"{sym}: ❗ Brackets failed after {attempts} tries. Flattening.")
                 t = self.exw.fetch_ticker(sym)
                 px = t.get("last") or t.get("close")
                 if px:
                     self.close(sym, positions, float(px), "NO_BRACKETS_SAFETY", risk, notifier, hedge_book)
-                self.repair_tasks.pop(sym, None)
-                self._persist(risk, positions, hedge_book)
 
     def sync_orders(self, positions):
         try:
@@ -982,7 +1040,9 @@ class ExecutionEngine:
         by_sym: Dict[str, List[dict]] = {}
         for o in open_orders:
             by_sym.setdefault(o.get("symbol", ""), []).append(o)
-        for sym, pos in positions.items():
+        with self.lock:
+            items = list(positions.items())
+        for sym, pos in items:
             if not pos or sym not in by_sym:
                 continue
             for o in by_sym[sym]:
@@ -1003,38 +1063,49 @@ class ExecutionEngine:
                     continue
                 if pos.side == "short" and side != "buy":
                     continue
-                if typ in ("STOP", "STOP_MARKET") and sp:
-                    pos.sl_order_id = o.get("id") or info.get("orderId")
-                    if not pos.sl:
-                        pos.sl = sp
-                if typ in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET") and sp:
-                    pos.tp_order_id = o.get("id") or info.get("orderId")
-                    if not pos.tp:
-                        pos.tp = sp
+                with self.lock:
+                    p2 = positions.get(sym)
+                    if not p2:
+                        continue
+                    if typ in ("STOP", "STOP_MARKET") and sp:
+                        p2.sl_order_id = o.get("id") or info.get("orderId")
+                        if not p2.sl:
+                            p2.sl = sp
+                    if typ in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET") and sp:
+                        p2.tp_order_id = o.get("id") or info.get("orderId")
+                        if not p2.tp:
+                            p2.tp = sp
 
     def close(self, symbol, positions, price, reason, risk, notifier, hedge_book=None):
-        p = positions.get(symbol)
+        with self.lock:
+            p = positions.get(symbol)
         if not p:
             return
         pnl = p.dir() * p.qty * (price - p.entry)
         if self.mode == Mode.LIVE:
             try:
-                self._cancel_brackets(symbol, p)
+                with self.lock:
+                    p2 = positions.get(symbol)
+                    if p2:
+                        self._cancel_brackets(symbol, p2)
                 self.exw.ex.create_order(symbol, type="market", side=self._opposite(p.side), amount=p.qty, params={"reduceOnly": True})
             except Exception as e:
                 logging.error(f"LIVE close failed {symbol}: {e}")
-        positions[symbol] = None
-        risk.update_on_close(pnl)
+        with self.lock:
+            positions[symbol] = None
+            risk.update_on_close(pnl)
         notifier.send(f"{symbol}: ❌ CLOSE {reason} pnl=${pnl:.2f} equity=${risk.balance:.2f}")
         self._persist(risk, positions, hedge_book)
 
     def external_filled_close(self, symbol, fill_price: float, positions, risk, notifier, reason="BRACKET_FILLED", hedge_book=None):
-        p = positions.get(symbol)
+        with self.lock:
+            p = positions.get(symbol)
         if not p:
             return
         pnl = p.dir() * p.qty * (fill_price - p.entry)
-        positions[symbol] = None
-        risk.update_on_close(pnl)
+        with self.lock:
+            positions[symbol] = None
+            risk.update_on_close(pnl)
         notifier.send(f"{symbol}: ✅ {reason} @ {fill_price:.4f} pnl=${pnl:.2f} equity=${risk.balance:.2f}")
         self._persist(risk, positions, hedge_book)
 
@@ -1090,12 +1161,12 @@ class HedgeEngine:
         self.last_rebalance = 0.0
 
     def _beta(self, sym: str, base: str = "BTC/USDT") -> float:
-        ds = self.bot.data.get(sym, "5m")
-        db = self.bot.data.get(base, "5m")
-        if ds.empty or db.empty:
+        df_s = self.bot.data.get(sym, "5m")
+        df_b = self.bot.data.get(base, "5m")
+        if df_s.empty or df_b.empty:
             return 1.0
-        rs = ds["close"].pct_change().dropna().tail(400)
-        rb = db["close"].pct_change().dropna().tail(400)
+        rs = df_s["close"].pct_change().dropna().tail(400)
+        rb = df_b["close"].pct_change().dropna().tail(400)
         n = min(len(rs), len(rb))
         if n < 120:
             return 1.0
@@ -1105,32 +1176,32 @@ class HedgeEngine:
         return float(np.clip(cov / varb if varb > 0 else 1.0, -2.0, 2.0))
 
     def compute_overlay_target(self):
+        with self.bot.lock:
+            items = list(self.bot.positions.items())
+            bal = self.bot.risk.balance
         net = 0.0
-        for p in self.bot.positions.values():
+        for _, p in items:
             if not p or p.is_hedge or p.mode == "recovery":
                 continue
             price = self.bot.prices.get(p.symbol, self.bot.data.get(p.symbol, "5m"))
             if not price:
                 continue
             net += self._beta(p.symbol) * p.dir() * p.qty * price
-        dd = self.bot.risk.drawdown
+        dd = (max(bal, 1e-9) - bal) / max(bal, 1e-9)  # safe, but dd read from risk under lock elsewhere
+        dd = self.bot.risk.drawdown  # prefer accurate
         ratio = 0.6 + min(0.4, dd * 2.0)
         if self.bot.risk.risk_off:
             ratio = max(ratio, 1.0)
-        sym = "BTC/USDT"
-        pb = self.bot.prices.get(sym, self.bot.data.get(sym, "5m"))
+        pb = self.bot.prices.get("BTC/USDT", self.bot.data.get("BTC/USDT", "5m"))
         if pb:
             self.overlay_qty_target = (-ratio * net) / pb
 
     def open_temp_hedge_for(self, underlier_sym: str, main_side: str, main_qty: float, main_entry: float):
-        sym = "BTC/USDT"
-        pb = self.bot.prices.get(sym, self.bot.data.get(sym, "5m"))
+        pb = self.bot.prices.get("BTC/USDT", self.bot.data.get("BTC/USDT", "5m"))
         if not pb:
             return
         notional = main_qty * main_entry * TEMP_ENTRY_HEDGE_FRAC
         qty_b = notional / pb
-        # If main trade is long alt, we short BTC => negative temp qty (short)
-        # If main trade is short alt, we long BTC => positive temp qty (long)
         delta = -qty_b if main_side == "long" else qty_b
         current = self.temp_qty_by_underlier.get(underlier_sym, 0.0)
         self.temp_qty_by_underlier[underlier_sym] = current + delta
@@ -1147,7 +1218,8 @@ class HedgeEngine:
         return self.overlay_qty_target + sum(self.temp_qty_by_underlier.values())
 
     def current_hedge_qty(self) -> float:
-        p = self.bot.positions.get("BTC/USDT")
+        with self.bot.lock:
+            p = self.bot.positions.get("BTC/USDT")
         if p and p.is_hedge:
             return p.dir() * p.qty
         return 0.0
@@ -1164,57 +1236,49 @@ class HedgeEngine:
         if price_b is None:
             self.last_rebalance = time.time()
             return
+        with self.bot.lock:
+            p = self.bot.positions.get(sym)
 
-        p = self.bot.positions.get(sym)
-
-        # No change
         if abs(delta) < 1e-9:
             self.last_rebalance = time.time()
             return
 
-        # If no current hedge
         if not p or not p.is_hedge:
-            if delta > 0:
-                intent = (sym, "long", abs(delta), price_b, 0.0, 0.0, 1.0, "hedge", "overlay")
-            else:
-                intent = (sym, "short", abs(delta), price_b, 0.0, 0.0, 1.0, "hedge", "overlay")
+            side = "long" if delta > 0 else "short"
+            intent = (sym, side, abs(delta), price_b, 0.0, 0.0, 1.0, "hedge", "overlay")
             opened = self.bot.engine.open(intent, self.bot.positions, self.bot.risk, self.bot.notifier, hedge_book=self.snapshot())
             if opened:
-                pos = self.bot.positions.get(sym)
-                if pos:
-                    pos.is_hedge = True
-                    pos.mode = "hedge"
-                    pos.tag = "hedge"
+                with self.bot.lock:
+                    pos = self.bot.positions.get(sym)
+                    if pos:
+                        pos.is_hedge = True
+                        pos.mode = "hedge"
+                        pos.tag = "hedge"
             self.last_rebalance = time.time()
             self.bot.persistence.save(self.bot.risk, self.bot.positions, pending=self.bot.engine.pending_intents, hedge_book=self.snapshot())
             return
 
-        # Existing hedge present
+        # existing hedge present
         sign_cur = 1 if p.side == "long" else -1
         desired_sign = 1 if delta > 0 else -1
-
-        # Same direction: add size
         if desired_sign == sign_cur:
             self.bot.engine.add_size(sym, abs(delta), self.bot.positions, self.bot.risk, self.bot.notifier, hedge_book=self.snapshot())
         else:
-            # Opposite direction: reduce or flip
             if abs(delta) <= p.qty:
-                # reduce only
                 self.bot.engine.partial_close(sym, abs(delta), self.bot.positions, self.bot.risk, self.bot.notifier, hedge_book=self.snapshot())
             else:
-                # flip: close current and open remaining on opposite side
                 remainder = abs(delta) - p.qty
                 self.bot.engine.partial_close(sym, p.qty, self.bot.positions, self.bot.risk, self.bot.notifier, hedge_book=self.snapshot())
-                # Now open new side
-                side = "long" if desired_sign > 0 else "short"
-                intent = (sym, side, remainder, price_b, 0.0, 0.0, 1.0, "hedge", "overlay")
-                opened = self.bot.engine.open(intent, self.bot.positions, self.bot.risk, self.bot.notifier, hedge_book=self.snapshot())
-                if opened:
-                    pos2 = self.bot.positions.get(sym)
-                    if pos2:
-                        pos2.is_hedge = True
-                        pos2.mode = "hedge"
-                        pos2.tag = "hedge"
+                side2 = "long" if desired_sign > 0 else "short"
+                intent2 = (sym, side2, remainder, price_b, 0.0, 0.0, 1.0, "hedge", "overlay")
+                opened2 = self.bot.engine.open(intent2, self.bot.positions, self.bot.risk, self.bot.notifier, hedge_book=self.snapshot())
+                if opened2:
+                    with self.bot.lock:
+                        pos2 = self.bot.positions.get(sym)
+                        if pos2:
+                            pos2.is_hedge = True
+                            pos2.mode = "hedge"
+                            pos2.tag = "hedge"
 
         self.last_rebalance = time.time()
         self.bot.persistence.save(self.bot.risk, self.bot.positions, pending=self.bot.engine.pending_intents, hedge_book=self.snapshot())
@@ -1224,15 +1288,12 @@ class HedgeEngine:
 
 
 class UserStream:
-    """
-    Binance Futures user data WebSocket (python-binance).
-    We consume ORDER_TRADE_UPDATE for bracket fills and reconcile immediately.
-    """
-    def __init__(self, api_key: str, api_secret: str, exwrap: ExchangeWrapper, on_order_update):
+    """Binance Futures user data WebSocket -> enqueue fills to main thread."""
+    def __init__(self, api_key: str, api_secret: str, exwrap: ExchangeWrapper, enqueue_event):
         self.api_key = api_key
         self.api_secret = api_secret
         self.exwrap = exwrap
-        self.on_order_update = on_order_update
+        self.enqueue_event = enqueue_event
         self.twm: Optional[ThreadedWebsocketManager] = None
 
     def start(self):
@@ -1259,19 +1320,20 @@ class UserStream:
 
     def _handler(self, msg: dict):
         try:
-            e = msg.get('e')
-            if e == 'ORDER_TRADE_UPDATE':
-                o = msg.get('o', {})
-                market_id = o.get('s')
-                symbol = self.exwrap.id_to_symbol(market_id) or f"{market_id[:-4]}/{market_id[-4:]}"
-                ord_type = o.get('o', '')  # ORDER TYPE
-                status = o.get('X', '')    # FILLED, PARTIALLY_FILLED, CANCELED, NEW
-                side = o.get('S', '')      # BUY/SELL
-                order_id = str(o.get('i') or o.get('orderId'))
-                last_fill = float(o.get('L') or 0.0)
-                avg_price = float(o.get('ap') or last_fill or 0.0)
-                reduce_only = str(o.get('R', 'false')).lower() == 'true' or str(o.get('r', 'false')).lower() == 'true'
-                self.on_order_update(symbol, ord_type, status, side, order_id, avg_price, reduce_only, raw=o)
+            if msg.get('e') != 'ORDER_TRADE_UPDATE':
+                return
+            o = msg.get('o', {})
+            market_id = o.get('s')
+            symbol = self.exwrap.id_to_symbol(market_id) or f"{market_id[:-4]}/{market_id[-4:]}"
+            ord_type = o.get('o', '')
+            status = o.get('X', '')
+            side = o.get('S', '')
+            order_id = str(o.get('i') or o.get('orderId'))
+            last_fill = float(o.get('L') or 0.0)
+            avg_price = float(o.get('ap') or last_fill or 0.0)
+            reduce_only = str(o.get('R', 'false')).lower() == 'true' or str(o.get('r', 'false')).lower() == 'true'
+            ev = OrderEvent(symbol, ord_type, status, side, order_id, avg_price, reduce_only)
+            self.enqueue_event(ev)
         except Exception as e:
             logging.debug(f"UserStream handler error: {e}")
 
@@ -1291,15 +1353,20 @@ class OmegaXBot:
         self.notifier = Notifier(TELEGRAM_ENABLED)
         self.persistence = Persistence()
         self.positions: Dict[str, Optional[Position]] = {s: None for s in self.symbols}
+        self.lock = RLock()
         self.portfolio = Portfolio(self)
-        self.engine = ExecutionEngine(Mode.PAPER if MODE == "paper" else Mode.LIVE, self.ex, self.persistence, self.notifier)
+        self.engine = ExecutionEngine(Mode.PAPER if MODE == "paper" else Mode.LIVE, self.ex, self.persistence, self.notifier, self.lock)
         self.hedger = HedgeEngine(self)
         self.last_report = 0.0
+
+        # WS event queue (single-writer)
+        self.events: Queue[OrderEvent] = Queue()
 
         # user websocket for fills (live only)
         self.user_ws: Optional[UserStream] = None
         if MODE == "live":
-            self.user_ws = UserStream(os.environ.get("BINANCE_API_KEY", ""), os.environ.get("BINANCE_API_SECRET", ""), self.ex, self._on_order_update)
+            self.user_ws = UserStream(os.environ.get("BINANCE_API_KEY", ""), os.environ.get("BINANCE_API_SECRET", ""),
+                                      self.ex, self.enqueue_event)
 
         self._start_health_server()
         self._restore_state()
@@ -1312,30 +1379,50 @@ class OmegaXBot:
 
         self.notifier.send(f"🛡️ OmegaX online ({MODE}). {len(self.symbols)} symbols. Equity ${self.risk.balance:.2f}")
 
+    def enqueue_event(self, ev: OrderEvent):
+        self.events.put(ev)
+
+    def _drain_events(self):
+        # Process WS events in main thread
+        while True:
+            try:
+                ev = self.events.get_nowait()
+            except Empty:
+                break
+            # Only care about bracket/reduce-only fills
+            if ev.status != "FILLED":
+                continue
+            is_bracket = ev.ord_type.upper() in ("STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET") or ev.reduce_only
+            if not is_bracket:
+                continue
+            fill = ev.avg_price if ev.avg_price > 0 else (self.prices.get(ev.symbol, self.data.get(ev.symbol, "5m")) or 0.0)
+            if fill:
+                self.engine.external_filled_close(ev.symbol, float(fill), self.positions, self.risk, self.notifier, reason=f"{ev.ord_type}_FILLED", hedge_book=self.hedger.snapshot())
+
     def _start_health_server(self):
         app = Flask(__name__)
 
         @app.route("/health")
         def _h():
+            with self.lock:
+                snap_positions = {k: (asdict(v) if v else None) for k, v in self.positions.items() if k in self.symbols}
+                rb = self.risk.balance
+                dd = self.risk.drawdown
+                ro = self.risk.risk_off
+                pu = self.risk.paused_until
             return jsonify({
-                "ok": True,
-                "equity": self.risk.balance,
-                "dd": self.risk.drawdown,
-                "risk_off": self.risk.risk_off,
-                "paused_until": self.risk.paused_until,
-                "positions": {k: (asdict(v) if v else None) for k, v in self.positions.items() if k in self.symbols},
-                "loss_bucket": self.risk.loss_bucket,
-                "hedge_book": self.hedger.snapshot()
+                "ok": True, "equity": rb, "dd": dd, "risk_off": ro, "paused_until": pu,
+                "positions": snap_positions, "loss_bucket": self.risk.loss_bucket, "hedge_book": self.hedger.snapshot()
             })
 
         @app.route("/metrics")
         def _m():
-            return jsonify({
-                "equity": self.risk.balance,
-                "dd": self.risk.drawdown,
-                "open_positions": sum(1 for p in self.positions.values() if p),
-                "daily_pnl": self.risk.daily_pnl
-            })
+            with self.lock:
+                open_positions = sum(1 for p in self.positions.values() if p)
+                rb = self.risk.balance
+                dd = self.risk.drawdown
+                daily = self.risk.daily_pnl
+            return jsonify({"equity": rb, "dd": dd, "open_positions": open_positions, "daily_pnl": daily})
 
         threading.Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": PORT}, daemon=True).start()
 
@@ -1343,20 +1430,21 @@ class OmegaXBot:
         st = self.persistence.load()
         if not st:
             return
-        self.risk.balance = st.get("balance", self.risk.balance)
-        self.risk.equity_peak = st.get("equity_peak", self.risk.balance)
-        self.risk.daily_pnl = st.get("daily_pnl", 0.0)
-        self.risk.loss_bucket = st.get("loss_bucket", 0.0)
-        self.risk.cooldown = st.get("cooldown", {})
-        self.risk.paused_until = st.get("paused_until", 0.0)
-        setattr(self.risk, "_risk_off_until", st.get("risk_off_until", 0.0))
-        for s, p in st.get("positions", {}).items():
-            if p:
-                try:
-                    self.positions[s] = Position(**p)
-                except Exception:
-                    self.positions[s] = None
-        self.engine.pending_intents = st.get("pending_intents", [])
+        with self.lock:
+            self.risk.balance = st.get("balance", self.risk.balance)
+            self.risk.equity_peak = st.get("equity_peak", self.risk.balance)
+            self.risk.daily_pnl = st.get("daily_pnl", 0.0)
+            self.risk.loss_bucket = st.get("loss_bucket", 0.0)
+            self.risk.cooldown = st.get("cooldown", {})
+            self.risk.paused_until = st.get("paused_until", 0.0)
+            setattr(self.risk, "_risk_off_until", st.get("risk_off_until", 0.0))
+            for s, p in st.get("positions", {}).items():
+                if p:
+                    try:
+                        self.positions[s] = Position(**p)
+                    except Exception:
+                        self.positions[s] = None
+            self.engine.pending_intents = st.get("pending_intents", [])
         hb = st.get("hedge_book", {})
         self.hedger.overlay_qty_target = hb.get("overlay_qty_target", 0.0)
         self.hedger.temp_qty_by_underlier = hb.get("temp_qty_by_underlier", {})
@@ -1378,25 +1466,12 @@ class OmegaXBot:
                 entry = float(r.get("entryPrice") or r.get("entry_price") or 0.0)
                 live_map[sym] = Position(sym, side, abs(amt), entry, 0.0, 0.0, 1.0, time.time(), mode="directional", tag="sync")
             if live_map:
-                for s in self.symbols:
-                    self.positions[s] = live_map.get(s)
+                with self.lock:
+                    for s in self.symbols:
+                        self.positions[s] = live_map.get(s)
             logging.info(f"Live sync: {len(live_map)} positions.")
         except Exception as e:
             logging.warning(f"Live sync failed/skipped: {e}")
-
-    def _on_order_update(self, symbol: str, ord_type: str, status: str, side: str, order_id: str, avg_price: float, reduce_only: bool, raw: dict):
-        """WebSocket reconciliation: handle bracket fills and cancel/replace race safely."""
-        if status != "FILLED":
-            return
-        p = self.positions.get(symbol)
-        if not p:
-            return
-        typ = ord_type.upper()
-        is_bracket = typ in ("STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET") or reduce_only
-        if not is_bracket:
-            return
-        fill = avg_price if avg_price > 0 else (self.prices.get(symbol, self.data.get(symbol, "5m")) or p.entry)
-        self.engine.external_filled_close(symbol, float(fill), self.positions, self.risk, self.notifier, reason=f"{typ}_FILLED", hedge_book=self.hedger.snapshot())
 
     def run(self):
         logging.info("Cold start: loading OHLCV...")
@@ -1405,9 +1480,10 @@ class OmegaXBot:
 
         while True:
             try:
-                # repair brackets if needed
-                self.engine.tick_repair(self.positions, self.risk, self.notifier, hedge_book=self.hedger.snapshot())
+                # Process WS fills safely
+                self._drain_events()
 
+                # Minimal risk check
                 self.data.schedule_updates(MAX_KLINE_UPDATES_PER_LOOP)
                 self.prices.update_next()
                 self.funding.maybe_update()
@@ -1418,10 +1494,11 @@ class OmegaXBot:
                 btc_df5 = df5_map.get("BTC/USDT", pd.DataFrame())
                 cs_rank_map = self.strategy.cross_sectional_mom_rank(df1h_map)
 
-                open_dirs = sum(1 for p in self.positions.values() if p and not p.is_hedge and p.mode != "recovery")
+                with self.lock:
+                    open_dirs = sum(1 for p in self.positions.values() if p and not p.is_hedge and p.mode != "recovery")
 
-                # priorities
-                priorities = []
+                # Rank priorities by 1h mom + 5m slope
+                priorities: List[Tuple[float, str]] = []
                 for s in self.symbols:
                     df5 = df5_map[s]
                     df1h = df1h_map[s]
@@ -1449,8 +1526,9 @@ class OmegaXBot:
                         continue
                     regime, vol_spike = self.strategy.detect_regime(df5, df15)
 
-                    # manage existing
-                    if self.positions[s]:
+                    with self.lock:
+                        has_pos = bool(self.positions.get(s))
+                    if has_pos:
                         self._manage_position(s, price, df5)
                         continue
 
@@ -1485,8 +1563,10 @@ class OmegaXBot:
                         if sl <= 0 or tp <= 0 or sl == price or tp == price:
                             continue
                         lev = self.risk.dynamic_leverage(vol_spike, alpha_boost)
+                        with self.lock:
+                            open_list = [p for p in self.positions.values() if p]
                         base = (RISK_PER_TRADE / max(1, len(self.symbols))) * self.risk.risk_multiplier(vol_spike, alpha_boost)
-                        qty = self.risk.position_size_qty(price, sl, base, [p for p in self.positions.values() if p])
+                        qty = self.risk.position_size_qty(price, sl, base, open_list)
                         if qty <= 0:
                             continue
                         tag = max(wts.items(), key=lambda kv: kv[1])[0]
@@ -1497,7 +1577,6 @@ class OmegaXBot:
                             self.risk.note_open(s)
                             self.hedger.open_temp_hedge_for(s, side, qty, price)
 
-                    # recovery (needs alignment)
                     if RECOVERY_ENABLED and self._can_open_recovery(open_dirs):
                         f = self.strategy.features(df5, df15, df1h)
                         atr = float(f["atr"].iloc[-1])
@@ -1546,14 +1625,16 @@ class OmegaXBot:
             return False
         if open_dirs >= MAX_CONCURRENT_POS:
             return False
-        active = sum(1 for p in self.positions.values() if p and p.mode == "recovery")
+        with self.lock:
+            active = sum(1 for p in self.positions.values() if p and p.mode == "recovery")
         return active < MAX_PARALLEL_RECOVERY_TRADES
 
     def _pnl(self, p: Position, price: float) -> float:
         return p.dir() * p.qty * (price - p.entry)
 
     def _manage_position(self, s: str, price: float, df5: pd.DataFrame):
-        p = self.positions[s]
+        with self.lock:
+            p = self.positions.get(s)
         if not p:
             return
         # backup client-side checks (native brackets handle real exits)
@@ -1580,73 +1661,95 @@ class OmegaXBot:
                 close_qty = p.qty * PARTIAL_FRACTION
                 if self.engine.mode == Mode.PAPER:
                     pnl_part = p.dir() * close_qty * (price - p.entry)
-                    p.qty -= close_qty
-                    p.partial = True
-                    self.risk.update_on_close(pnl_part)
+                    with self.lock:
+                        p2 = self.positions.get(s)
+                        if not p2:
+                            return
+                        p2.qty -= close_qty
+                        p2.partial = True
+                        self.risk.update_on_close(pnl_part)
                     self.notifier.send(f"{s}: Partial ✔️ +${pnl_part:.2f}")
                     changed = True
                 else:
                     pnl_part = self.engine.partial_close(s, close_qty, self.positions, self.risk, self.notifier, hedge_book=self.hedger.snapshot())
                     if pnl_part is not None:
-                        p = self.positions.get(s)
-                        if not p:
-                            return
-                        p.partial = True
+                        with self.lock:
+                            p2 = self.positions.get(s)
+                            if not p2:
+                                return
+                            p2.partial = True
                         changed = True
-                if p:
-                    if p.side == "long":
-                        p.sl = max(p.sl, price - atr * 1.2)
-                    else:
-                        p.sl = min(p.sl, price + atr * 1.2)
-                    changed = True
+                with self.lock:
+                    p3 = self.positions.get(s)
+                    if p3:
+                        if p3.side == "long":
+                            p3.sl = max(p3.sl, price - atr * 1.2)
+                        else:
+                            p3.sl = min(p3.sl, price + atr * 1.2)
+                        changed = True
 
             trail_mult = TRAIL_ATR_BASE
             if r_mult >= 3:
                 trail_mult = TRAIL_ATR_TIGHT3
             elif r_mult >= 2:
                 trail_mult = TRAIL_ATR_TIGHT2
-            if p.side == "long" and price > p.entry + atr:
-                new_sl = max(p.sl, price - atr * trail_mult)
-                if new_sl > p.sl:
-                    p.sl = new_sl
-                    changed = True
-            elif p.side == "short" and price < p.entry - atr:
-                new_sl = min(p.sl, price + atr * trail_mult)
-                if new_sl < p.sl:
-                    p.sl = new_sl
-                    changed = True
+            with self.lock:
+                p4 = self.positions.get(s)
+                if p4:
+                    if p4.side == "long" and price > p4.entry + atr:
+                        new_sl = max(p4.sl, price - atr * trail_mult)
+                        if new_sl > p4.sl:
+                            p4.sl = new_sl
+                            changed = True
+                    elif p4.side == "short" and price < p4.entry - atr:
+                        new_sl = min(p4.sl, price + atr * trail_mult)
+                        if new_sl < p4.sl:
+                            p4.sl = new_sl
+                            changed = True
 
-        if p and p.pyramids < PYRAMID_MAX_STEPS and atr > 0:
-            trigger = (p.last_add_price or p.entry) + (atr * PYRAMID_STEP_ATR * (1 if p.side == "long" else -1))
-            if (p.side == "long" and price > trigger) or (p.side == "short" and price < trigger):
-                add_qty = p.qty * PYRAMID_ADD_FRAC
-                sim = [pp for pp in self.positions.values() if pp] + [Position(p.symbol, p.side, add_qty, price, p.sl, p.tp, p.lev, time.time())]
-                total_risk = sum(abs(sp.entry - sp.sl) * sp.qty for sp in sim if not sp.is_hedge) / max(1e-9, self.risk.balance)
+        with self.lock:
+            p_now = self.positions.get(s)
+        if p_now and p_now.pyramids < PYRAMID_MAX_STEPS and atr > 0:
+            trigger = (p_now.last_add_price or p_now.entry) + (atr * PYRAMID_STEP_ATR * (1 if p_now.side == "long" else -1))
+            if (p_now.side == "long" and price > trigger) or (p_now.side == "short" and price < trigger):
+                add_qty = p_now.qty * PYRAMID_ADD_FRAC
+                with self.lock:
+                    sim = [pp for pp in self.positions.values() if pp] + [Position(p_now.symbol, p_now.side, add_qty, price, p_now.sl, p_now.tp, p_now.lev, time.time())]
+                    total_risk = sum(abs(sp.entry - sp.sl) * sp.qty for sp in sim if not sp.is_hedge) / max(1e-9, self.risk.balance)
                 if total_risk < MAX_TOTAL_RISK:
                     if self.engine.mode == Mode.PAPER:
-                        p.entry = (p.entry * p.qty + price * add_qty) / (p.qty + add_qty)
-                        p.qty += add_qty
-                        p.pyramids += 1
-                        p.last_add_price = price
+                        with self.lock:
+                            p_now2 = self.positions.get(s)
+                            if not p_now2:
+                                return
+                            p_now2.entry = (p_now2.entry * p_now2.qty + price * add_qty) / (p_now2.qty + add_qty)
+                            p_now2.qty += add_qty
+                            p_now2.pyramids += 1
+                            p_now2.last_add_price = price
                     else:
                         self.engine.add_size(s, add_qty, self.positions, self.risk, self.notifier, hedge_book=self.hedger.snapshot())
-                        p = self.positions.get(s)
-                        if not p:
-                            return
-                        p.pyramids += 1
-                        p.last_add_price = price
+                        with self.lock:
+                            p_now3 = self.positions.get(s)
+                            if not p_now3:
+                                return
+                            p_now3.pyramids += 1
+                            p_now3.last_add_price = price
                     changed = True
 
-        if p and changed:
-            self.engine.replace_brackets(s, self.positions, p.qty, p.sl, p.tp, self.risk, self.notifier, hedge_book=self.hedger.snapshot())
+        if changed:
+            with self.lock:
+                p_final = self.positions.get(s)
+            if p_final:
+                self.engine.replace_brackets(s, self.positions, p_final.qty, p_final.sl, p_final.tp, self.risk, self.notifier, hedge_book=self.hedger.snapshot())
 
     def _hourly_report(self):
         if time.time() - self.last_report < 3600:
             return
-        msg = (
-            f"📊 Hourly | Equity ${self.risk.balance:.2f} (Δ ${self.risk.balance - INITIAL_BALANCE:.2f}) "
-            f"| DD {self.risk.drawdown*100:.2f}% | Daily ${self.risk.daily_pnl:.2f}"
-        )
+        with self.lock:
+            rb = self.risk.balance
+            dd = self.risk.drawdown
+            daily = self.risk.daily_pnl
+        msg = f"📊 Hourly | Equity ${rb:.2f} (Δ ${rb - INITIAL_BALANCE:.2f}) | DD {dd*100:.2f}% | Daily ${daily:.2f}"
         logging.info(msg)
         self.notifier.send(msg)
         self.last_report = time.time()
