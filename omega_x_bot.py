@@ -673,6 +673,70 @@ class Strategy:
             return "long", min(1.0, (-2.0 - zl) / 2.0)
         return None
 
+    def strength_trend(self, ema_f, ema_s, macd, macd_s, px, atr):
+        ema_gap = (ema_f - ema_s) / (atr + 1e-9)
+        macd_gap = (macd - macd_s) / (atr + 1e-9)
+        return sig01(0.7 * ema_gap + 0.3 * macd_gap), sig01(0.7 * (-ema_gap) + 0.3 * (-macd_gap))
+
+    def strength_meanrev(self, px, bb_u, bb_l, rsi, st_k, atr):
+        band_mid = (bb_u + bb_l) / 2.0
+        half = (bb_u - bb_l) / 2.0 + 1e-9
+        z = (px - band_mid) / half
+        rsi_bias = (50 - rsi) / 25.0
+        st_bias = (50 - st_k) / 25.0
+        return sig01(-z + 0.2 * rsi_bias + 0.1 * st_bias), sig01(+z - 0.2 * rsi_bias - 0.1 * st_bias)
+
+    def strength_vwap(self, px, vwap, macd, atr):
+        gap = (px - vwap) / (atr + 1e-9)
+        macd_sign = np.tanh(macd / (atr + 1e-9))
+        return sig01(gap + 0.2 * macd_sign), sig01(-gap - 0.2 * macd_sign)
+
+    def strength_donchian(self, px, don_hi, don_lo, atr):
+        return clamp01((px - don_hi) / (atr + 1e-9)), clamp01((don_lo - px) / (atr + 1e-9))
+
+    # <<< FIX STARTS HERE >>>
+    def alpha_scores(self, symbol, df5, df15, df1h, btc_df, cs_rank, funding_rate):
+        f = self.features(df5, df15, df1h)
+        px = float(df5["close"].iloc[-1])
+        last = float(df5["close"].iloc[-2]) if len(df5) >= 2 else px
+        change = (px - last) / last if last else 0.0
+        if abs(change) > 0.08:
+            return {}
+        atr = float(f["atr"].iloc[-1]) if not np.isnan(f["atr"].iloc[-1]) else max(1e-8, float(df5["close"].diff().abs().tail(14).mean()))
+
+        lt, st = self.strength_trend(f["ema_f"].iloc[-1], f["ema_s"].iloc[-1], f["macd"].iloc[-1], f["macd_s"].iloc[-1], px, atr)
+        lmr, smr = self.strength_meanrev(px, f["bb_u"].iloc[-1], f["bb_l"].iloc[-1], f["rsi"].iloc[-1], f["st_k"].iloc[-1], atr)
+        lvm, svm = self.strength_vwap(px, f["vwap"].iloc[-1], f["macd"].iloc[-1], atr)
+        ld, sd = self.strength_donchian(px, f["don_hi"].iloc[-1], f["don_lo"].iloc[-1], atr)
+
+        pr = self.pair_residual_side(df5, btc_df)
+        if pr:
+            side, mag = pr
+            lp, sp = (mag, 0.0) if side == "long" else (0.0, mag)
+        else:
+            lp, sp = 0.0, 0.0
+
+        cs_mag = float(np.clip(abs(cs_rank) / 2.5, 0.0, 1.0))
+        lxs, sxs = (cs_mag, 0.0) if cs_rank > 0 else (0.0, cs_mag)
+
+        cr_l = 0.0
+        cr_s = 0.0
+        if funding_rate is not None:
+            if funding_rate > HIGH_POSITIVE_FUNDING:
+                cr_s = float(np.clip((funding_rate - HIGH_POSITIVE_FUNDING) * 4000, 0.0, 1.0))
+            elif funding_rate < HIGH_NEGATIVE_FUNDING:
+                cr_l = float(np.clip((HIGH_NEGATIVE_FUNDING - funding_rate) * 4000, 0.0, 1.0))
+
+        return {
+            "trend": (lt, st),
+            "meanrev": (lmr, smr),
+            "vwap": (lvm, svm),
+            "donchian": (ld, sd),
+            "pair": (lp, sp),
+            "xsmom": (lxs, sxs),
+            "carry": (cr_l, cr_s),
+        }
+    # <<< FIX ENDS HERE >>>
 
 class PortfolioManager:
     def __init__(self, bot: "OmegaXBot"):
@@ -834,7 +898,9 @@ class ExecutionEngine:
                         pos.tp_order_id = tp_id
                 if not sl_id or not tp_id:
                     with self.lock:
-                        self.repair_tasks[symbol] = {"side": side, "qty": q, "sl": sl, "tp": tp, "attempts": 0, "next_try": time.time() + 3}
+                        self.repair_tasks[symbol] = {
+                            "side": side, "qty": q, "sl": sl, "tp": tp, "attempts": 0, "next_try": time.time() + 3
+                        }
                     notifier.send(f"{symbol}: ⚠️ Bracket placement incomplete. Repair scheduled.")
                 notifier.send(f"{symbol}: ✅ LIVE OPEN {mode}/{tag} {side.upper()} qty={q:.6f} @ {avg:.4f} SL={sl:.4f} TP={tp:.4f} lev={lev}x")
             with self.lock:
@@ -1325,7 +1391,7 @@ class OmegaXBot:
         self.persistence = Persistence()
         self.positions: Dict[str, Optional[Position]] = {s: None for s in self.symbols}
         self.lock = RLock()
-        self.portfolio = PortfolioManager(self)
+        self.portfolio_manager = PortfolioManager(self)
         self.engine = ExecutionEngine(Mode.PAPER if MODE == "paper" else Mode.LIVE, self.ex, self.persistence, self.notifier, self.lock)
         self.hedger = HedgeEngine(self)
         self.last_report = 0.0
@@ -1530,7 +1596,7 @@ class OmegaXBot:
                             continue
                         if not self.risk.can_trade(s):
                             continue
-                        if self.portfolio.bucket_violation():
+                        if self.portfolio_manager.bucket_violation():
                             continue
 
                         if not self.risk.risk_off:
