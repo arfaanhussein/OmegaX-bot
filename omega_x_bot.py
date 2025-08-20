@@ -4,12 +4,12 @@ OmegaX Futures Bot (Paper by default, LIVE-ready) - Thread-safe + Telegram lifec
 - Python 3.13.4
 - Exchange: Binance USDT-M Futures (ccxt REST; python-binance user WS for fills)
 - Concurrency safety:
-  - Single-writer event queue: WS thread only enqueues; main thread applies changes
+  - Single-writer event queue: WS thread only enqueues; main thread mutates state
   - Global RLock guards all state reads/writes
-  - Flask health endpoints take snapshots under lock
+  - Flask endpoints read snapshots under lock
 - Execution:
-  - Native SL/TP brackets at entry; cancel&replace after partials/trailing/pyramids
-  - Bracket repair loop + safety flatten if brackets can’t be placed
+  - Native SL/TP brackets at entry; cancel&replace on updates
+  - Bracket repair loop + safety flatten
   - Sync live open orders on startup (restore bracket IDs)
   - WS fills reconciliation fixes cancel/replace race
 - Strategy:
@@ -21,7 +21,7 @@ OmegaX Futures Bot (Paper by default, LIVE-ready) - Thread-safe + Telegram lifec
 
 Env:
   MODE = paper|live
-  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (optional but recommended)
+  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (recommended)
   BINANCE_API_KEY, BINANCE_API_SECRET (required in live)
   PORT (default 10000)
   LOG_LEVEL (default INFO)
@@ -55,7 +55,6 @@ from ta.volatility import BollingerBands, AverageTrueRange
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volume import VolumeWeightedAveragePrice
 
-# Optional user WS (only used in live)
 try:
     from binance.streams import ThreadedWebsocketManager
     BINANCE_WS_AVAILABLE = True
@@ -69,17 +68,15 @@ SYMBOLS = [
     "DOT/USDT", "MATIC/USDT", "BCH/USDT", "LTC/USDT", "NEAR/USDT",
     "FIL/USDT", "ATOM/USDT", "ICP/USDT", "APT/USDT", "ARB/USDT"
 ]
-# Alias mapping for Binance Futures (e.g., MATIC -> POL)
-SYMBOL_ALIASES = {
+SYMBOL_ALIASES = {  # Binance futures rename
     "MATIC/USDT": "POL/USDT",
 }
-
 INDEX_HEDGE_SYMBOLS = ["BTC/USDT"]
 
 TIMEFRAMES = ["5m", "15m", "1h"]
 TF_SECONDS = {"5m": 300, "15m": 900, "1h": 3600}
 
-MODE = os.environ.get("MODE", "paper").lower()  # "paper" or "live"
+MODE = os.environ.get("MODE", "paper").lower()
 
 INITIAL_BALANCE = 3000.0
 LEVERAGE_MIN = 10.0
@@ -189,7 +186,6 @@ class Notifier:
         self._last = time.time()
 
     def send_critical(self, msg: str):
-        # bypass tiny spacing to deliver instantly
         last = self._last
         self._last = 0.0
         try:
@@ -385,7 +381,7 @@ class Persistence:
 @dataclass
 class Position:
     symbol: str
-    side: str       # long/short
+    side: str
     qty: float
     entry: float
     sl: float
@@ -394,7 +390,7 @@ class Position:
     opened_at: float
     partial: bool = False
     is_hedge: bool = False
-    mode: str = "directional"   # directional | recovery | hedge | temp_hedge
+    mode: str = "directional"
     pyramids: int = 0
     last_add_price: Optional[float] = None
     tag: str = "meta"
@@ -677,63 +673,37 @@ class Strategy:
             return "long", min(1.0, (-2.0 - zl) / 2.0)
         return None
 
-    def strength_trend(self, ema_f, ema_s, macd, macd_s, px, atr):
-        ema_gap = (ema_f - ema_s) / (atr + 1e-9)
-        macd_gap = (macd - macd_s) / (atr + 1e-9)
-        return sig01(0.7 * ema_gap + 0.3 * macd_gap), sig01(0.7 * (-ema_gap) + 0.3 * (-macd_gap))
 
-    def strength_meanrev(self, px, bb_u, bb_l, rsi, st_k, atr):
-        band_mid = (bb_u + bb_l) / 2.0
-        half = (bb_u - bb_l) / 2.0 + 1e-9
-        z = (px - band_mid) / half
-        rsi_bias = (50 - rsi) / 25.0
-        st_bias = (50 - st_k) / 25.0
-        return sig01(-z + 0.2 * rsi_bias + 0.1 * st_bias), sig01(+z - 0.2 * rsi_bias - 0.1 * st_bias)
+class PortfolioManager:
+    def __init__(self, bot: "OmegaXBot"):
+        self.bot = bot
 
-    def strength_vwap(self, px, vwap, macd, atr):
-        gap = (px - vwap) / (atr + 1e-9)
-        macd_sign = np.tanh(macd / (atr + 1e-9))
-        return sig01(gap + 0.2 * macd_sign), sig01(-gap - 0.2 * macd_sign)
+    def exposure(self) -> Dict[str, float]:
+        with self.bot.lock:
+            items = list(self.bot.positions.items())
+        res: Dict[str, float] = {}
+        for _, p in items:
+            if not p or p.is_hedge:
+                continue
+            price = self.bot.prices.get(p.symbol, self.bot.data.get(p.symbol, "5m"))
+            if not price:
+                continue
+            res[p.symbol] = res.get(p.symbol, 0.0) + p.dir() * p.qty * price
+        return res
 
-    def strength_donchian(self, px, don_hi, don_lo, atr):
-        return clamp01((px - don_hi) / (atr + 1e-9)), clamp01((don_lo - px) / (atr + 1e-9))
-
-    def alpha_scores(self, symbol, df5, df15, df1h, btc_df, cs_rank, funding_rate):
-        f = self.features(df5, df15, df1h)
-        px = float(df5["close"].iloc[-1])
-        last = float(df5["close"].iloc[-2]) if len(df5) >= 2 else px
-        change = (px - last) / last if last else 0.0
-        if abs(change) > 0.08:
-            return {}
-        atr = float(f["atr"].iloc[-1]) if not np.isnan(f["atr"].iloc[-1]) else max(1e-8, float(df5["close"].diff().abs().tail(14).mean()))
-        lt, st = self.strength_trend(f["ema_f"].iloc[-1], f["ema_s"].iloc[-1], f["macd"].iloc[-1], f["macd_s"].iloc[-1], px, atr)
-        lmr, smr = self.strength_meanrev(px, f["bb_u"].iloc[-1], f["bb_l"].iloc[-1], f["rsi"].iloc[-1], f["st_k"].iloc[-1], atr)
-        lvm, svm = self.strength_vwap(px, f["vwap"].iloc[-1], f["macd"].iloc[-1], atr)
-        ld, sd = self.strength_donchian(px, f["don_hi"].iloc[-1], f["don_lo"].iloc[-1], atr)
-        pr = self.pair_residual_side(df5, btc_df)
-        if pr:
-            side, mag = pr
-            lp, sp = (mag, 0.0) if side == "long" else (0.0, mag)
-        else:
-            lp, sp = 0.0, 0.0
-        cs_mag = float(np.clip(abs(cs_rank) / 2.5, 0.0, 1.0))
-        lxs, sxs = (cs_mag, 0.0) if cs_rank > 0 else (0.0, cs_mag)
-        cr_l = 0.0
-        cr_s = 0.0
-        if funding_rate is not None:
-            if funding_rate > HIGH_POSITIVE_FUNDING:
-                cr_s = float(np.clip((funding_rate - HIGH_POSITIVE_FUNDING) * 4000, 0.0, 1.0))
-            elif funding_rate < HIGH_NEGATIVE_FUNDING:
-                cr_l = float(np.clip((HIGH_NEGATIVE_FUNDING - funding_rate) * 4000, 0.0, 1.0))
-        return {
-            "trend": (lt, st),
-            "meanrev": (lmr, smr),
-            "vwap": (lvm, svm),
-            "donchian": (ld, sd),
-            "pair": (lp, sp),
-            "xsmom": (lxs, sxs),
-            "carry": (cr_l, cr_s),
-        }
+    def bucket_violation(self) -> Optional[str]:
+        # basic bucket caps (majors vs alts)
+        majors = {"BTC/USDT", "ETH/USDT", "BNB/USDT"}
+        with self.bot.lock:
+            bal = self.bot.risk.balance
+        e = self.exposure()
+        majors_exp = sum(v for s, v in e.items() if s in majors)
+        alts_exp = sum(v for s, v in e.items() if s not in majors)
+        if abs(majors_exp) > 0.65 * bal:
+            return "majors"
+        if abs(alts_exp) > 0.55 * bal:
+            return "alts"
+        return None
 
 
 @dataclass
@@ -1355,7 +1325,7 @@ class OmegaXBot:
         self.persistence = Persistence()
         self.positions: Dict[str, Optional[Position]] = {s: None for s in self.symbols}
         self.lock = RLock()
-        self.portfolio = Portfolio(self)
+        self.portfolio = PortfolioManager(self)
         self.engine = ExecutionEngine(Mode.PAPER if MODE == "paper" else Mode.LIVE, self.ex, self.persistence, self.notifier, self.lock)
         self.hedger = HedgeEngine(self)
         self.last_report = 0.0
@@ -1382,7 +1352,6 @@ class OmegaXBot:
 
         self.notifier.send(f"✅ OmegaX online ({MODE}). Active symbols: {len(self.symbols)}. Equity ${self.risk.balance:.2f}")
 
-        # Signal handlers for graceful shutdown alerts
         def _sig_handler(sig, frame):
             try:
                 self.notifier.send_critical(f"🛑 Received signal {sig}. Shutting down.")
@@ -1466,7 +1435,6 @@ class OmegaXBot:
             self.risk.cooldown = st.get("cooldown", {})
             self.risk.paused_until = st.get("paused_until", 0.0)
             setattr(self.risk, "_risk_off_until", st.get("risk_off_until", 0.0))
-            # Restore only symbols we currently track (post-alias filtering)
             for s, p in st.get("positions", {}).items():
                 if p and s in self.positions:
                     try:
@@ -1509,7 +1477,6 @@ class OmegaXBot:
             logging.info("Done.")
             while True:
                 try:
-                    # Process WS fills safely
                     self._drain_events()
 
                     self.data.schedule_updates(MAX_KLINE_UPDATES_PER_LOOP)
@@ -1525,7 +1492,6 @@ class OmegaXBot:
                     with self.lock:
                         open_dirs = sum(1 for p in self.positions.values() if p and not p.is_hedge and p.mode != "recovery")
 
-                    # priorities: 1h momentum + 5m slope
                     priorities: List[Tuple[float, str]] = []
                     for s in self.symbols:
                         df5 = df5_map[s]
@@ -1676,7 +1642,6 @@ class OmegaXBot:
             p = self.positions.get(s)
         if not p:
             return
-        # backup client-side checks (native brackets handle real exits)
         if (p.side == "long" and price <= p.sl) or (p.side == "short" and price >= p.sl):
             pnl = self._pnl(p, price)
             self.engine.close(s, self.positions, price, "Stop", self.risk, self.notifier, hedge_book=self.hedger.snapshot())
