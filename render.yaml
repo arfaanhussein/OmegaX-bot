@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: omegax-bot
+    env: python
+    plan: starter
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: python omega_x_bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: MODE
+        value: "paper"
+      - key: TELEGRAM_TOKEN
+        value: "8384498061:AAElt7HeM88jfune948IcKkysHpw1tmXrlc"
+      - key: TELEGRAM_CHAT_ID
+        value: "1040990874"
+      - key: BINANCE_API_KEY
+        value: ""
+      - key: BINANCE_API_SECRET
+        value: ""
