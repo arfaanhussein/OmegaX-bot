@@ -126,11 +126,11 @@ BACKOFF_BASE = 1.5
 BACKOFF_MAX = 30.0
 HTTP_TIMEOUT = 10
 
-# --- FIX: Hardcoded for debugging - THIS IS INSECURE AND MUST BE REMOVED AFTER TESTING ---
-TELEGRAM_TOKEN = "8384498061:AAElt7HeM88jfune948IcKkysHpw1tmXrlc"  # Replace with your NEW token
-TELEGRAM_CHAT_ID = "1040990874" # Replace with your verified Chat ID
-# ------------------------------------------------------------------------------------
+# --- FIX: USE ENVIRONMENT VARIABLES ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+TELEGRAM_MIN_INTERVAL = 0.8  # This constant must be defined before Notifier class
 
 PORT = int(os.environ.get("PORT", "10000"))
 STATE_FILE = "state.json"
@@ -172,6 +172,7 @@ class Notifier:
         if not self.enabled:
             return
         now = time.time()
+        # This now works because TELEGRAM_MIN_INTERVAL is defined before this class is used
         if now - self._last < TELEGRAM_MIN_INTERVAL:
             time.sleep(TELEGRAM_MIN_INTERVAL - (now - self._last))
         try:
@@ -194,6 +195,9 @@ class Notifier:
         finally:
             self._last = last
 
+
+# ... (The rest of the file is identical to the last correct version) ...
+# I will include the full, correct code below for completeness without truncation.
 
 class Backoff:
     def __init__(self, base=BACKOFF_BASE, max_sleep=BACKOFF_MAX):
@@ -587,7 +591,6 @@ class MetaPolicy:
 
 
 def sig01(x: float) -> float:
-    # Use a try-except block to handle potential OverflowError
     try:
         return float(1.0 / (1.0 + np.exp(-x)))
     except OverflowError:
@@ -698,7 +701,7 @@ class Strategy:
 
     def strength_donchian(self, px, don_hi, don_lo, atr):
         return clamp01((px - don_hi) / (atr + 1e-9)), clamp01((don_lo - px) / (atr + 1e-9))
-    
+
     def alpha_scores(self, symbol, df5, df15, df1h, btc_df, cs_rank, funding_rate):
         f = self.features(df5, df15, df1h)
         px = float(df5["close"].iloc[-1])
@@ -1179,12 +1182,6 @@ class FundingCache:
 
 
 class HedgeEngine:
-    """
-    Two logical books:
-      - overlay_qty_target: float BTC qty target from portfolio beta (can be +/-)
-      - temp_qty_by_underlier: dict underlier->qty delta
-    Reconciled into one physical BTC/USDT hedge on exchange.
-    """
     def __init__(self, bot: "OmegaXBot"):
         self.bot = bot
         self.overlay_qty_target: float = 0.0
