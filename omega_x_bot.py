@@ -126,16 +126,19 @@ BACKOFF_BASE = 1.5
 BACKOFF_MAX = 30.0
 HTTP_TIMEOUT = 10
 
-# --- FIX: USE ENVIRONMENT VARIABLES ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+# --- FIX: Hardcoded for debugging - THIS IS INSECURE AND MUST BE REMOVED AFTER TESTING ---
+TELEGRAM_TOKEN = "8384498061:AAElt7HeM88jfune948IcKkysHpw1tmXrlc"  # Use your NEW token
+TELEGRAM_CHAT_ID = "1040990874"                                    # Use your verified Chat ID
+# -----------------------------------------------------------------------------------------
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
-TELEGRAM_MIN_INTERVAL = 0.8  # This constant must be defined before Notifier class
+TELEGRAM_MIN_INTERVAL = 0.8
 
 PORT = int(os.environ.get("PORT", "10000"))
 STATE_FILE = "state.json"
 # ====================================================
 
+# ... (The rest of the file is identical to the last correct version) ...
+# The full, correct code follows for completeness.
 
 def setup_logging():
     lvl = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -172,7 +175,6 @@ class Notifier:
         if not self.enabled:
             return
         now = time.time()
-        # This now works because TELEGRAM_MIN_INTERVAL is defined before this class is used
         if now - self._last < TELEGRAM_MIN_INTERVAL:
             time.sleep(TELEGRAM_MIN_INTERVAL - (now - self._last))
         try:
@@ -195,9 +197,6 @@ class Notifier:
         finally:
             self._last = last
 
-
-# ... (The rest of the file is identical to the last correct version) ...
-# I will include the full, correct code below for completeness without truncation.
 
 class Backoff:
     def __init__(self, base=BACKOFF_BASE, max_sleep=BACKOFF_MAX):
@@ -701,7 +700,7 @@ class Strategy:
 
     def strength_donchian(self, px, don_hi, don_lo, atr):
         return clamp01((px - don_hi) / (atr + 1e-9)), clamp01((don_lo - px) / (atr + 1e-9))
-
+    
     def alpha_scores(self, symbol, df5, df15, df1h, btc_df, cs_rank, funding_rate):
         f = self.features(df5, df15, df1h)
         px = float(df5["close"].iloc[-1])
@@ -763,7 +762,6 @@ class PortfolioManager:
         return res
 
     def bucket_violation(self) -> Optional[str]:
-        # basic bucket caps (majors vs alts)
         majors = {"BTC/USDT", "ETH/USDT", "BNB/USDT"}
         with self.bot.lock:
             bal = self.bot.risk.balance
@@ -789,7 +787,6 @@ class OrderEvent:
 
 
 class ExecutionEngine:
-    """Execution with native brackets, cancel/replace, repair, and order sync; lock-guarded state."""
     def __init__(self, mode: str, ex_wrapper: Optional[ExchangeWrapper], persistence: Persistence, notifier: Notifier, lock: RLock):
         self.mode = mode
         self.exw = ex_wrapper
@@ -866,7 +863,6 @@ class ExecutionEngine:
                 pass
             pos.tp_order_id = None
 
-    # intents: (symbol, side, qty, entry, sl, tp, lev, mode, tag)
     def open(self, intent, positions, risk, notifier, hedge_book=None) -> bool:
         symbol, side, qty, entry, sl, tp, lev, mode, tag = intent
         now = time.time()
@@ -1313,7 +1309,6 @@ class HedgeEngine:
 
 
 class UserStream:
-    """Binance Futures user data WebSocket -> enqueue fills to main thread."""
     def __init__(self, api_key: str, api_secret: str, exwrap: ExchangeWrapper, enqueue_event):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -1371,7 +1366,6 @@ class OmegaXBot:
 
         self.ex = ExchangeWrapper()
 
-        # Normalize symbols (aliases + filter by market availability)
         markets = self.ex.ex.load_markets()
         normalized = []
         for s in SYMBOLS:
@@ -1398,10 +1392,8 @@ class OmegaXBot:
         self.last_report = 0.0
         self._last_loop_error_notify = 0.0
 
-        # WS event queue (single-writer)
         self.events: Queue[OrderEvent] = Queue()
 
-        # user websocket for fills (live only)
         self.user_ws: Optional[UserStream] = None
         if MODE == "live":
             self.user_ws = UserStream(os.environ.get("BINANCE_API_KEY", ""), os.environ.get("BINANCE_API_SECRET", ""),
