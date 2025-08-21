@@ -126,10 +126,10 @@ BACKOFF_BASE = 1.5
 BACKOFF_MAX = 30.0
 HTTP_TIMEOUT = 10
 
-# --- FIX: Hardcoded for debugging - THIS IS INSECURE AND MUST BE REMOVED AFTER TESTING ---
-TELEGRAM_TOKEN = "8384498061:AAElt7HeM88jfune948IcKkysHpw1tmXrlc"  # Use your NEW token
-TELEGRAM_CHAT_ID = "1040990874"                                    # Use your verified Chat ID
-# -----------------------------------------------------------------------------------------
+# --- USE SECURE ENVIRONMENT VARIABLES ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+# ----------------------------------------
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 TELEGRAM_MIN_INTERVAL = 0.8
 
@@ -137,8 +137,6 @@ PORT = int(os.environ.get("PORT", "10000"))
 STATE_FILE = "state.json"
 # ====================================================
 
-# ... (The rest of the file is identical to the last correct version) ...
-# The full, correct code follows for completeness.
 
 def setup_logging():
     lvl = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -1703,6 +1701,12 @@ class OmegaXBot:
             p = self.positions.get(s)
         if not p:
             return
+        
+        # FIX: Do not manage hedge positions with SL/TP logic
+        if p.is_hedge:
+            return
+            
+        # backup client-side checks (native brackets handle real exits)
         if (p.side == "long" and price <= p.sl) or (p.side == "short" and price >= p.sl):
             pnl = self._pnl(p, price)
             self.engine.close(s, self.positions, price, "Stop", self.risk, self.notifier, hedge_book=self.hedger.snapshot())
