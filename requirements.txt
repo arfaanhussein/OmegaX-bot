@@ -1,7 +1,7 @@
-ccxt==4.3.59
-python-binance==1.0.17
-pandas==2.2.2
-numpy==1.26.4
-ta==0.11.0
-Flask==3.0.2
-requests==2.32.3
+echo "numpy==1.24.3
+pandas==2.0.3
+requests==2.31.0
+ccxt==4.0.77
+Flask==2.3.2
+ta==0.10.2
+psutil==5.9.5" > requirements.txt

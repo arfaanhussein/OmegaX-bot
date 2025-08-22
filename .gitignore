@@ -1,9 +1,6 @@
-pycache/
+echo "*.db
+*.log
 *.pyc
+__pycache__/
 .env
-state.json
-venv/
-.venv/
-.DS_Store
-.idea/
-.vscode/
+*.backup.*" > .gitignore
