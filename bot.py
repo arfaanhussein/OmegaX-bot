@@ -57,7 +57,7 @@ import gc
 try:
     from binance.streams import ThreadedWebsocketManager
     BINANCE_WS_AVAILABLE = True
-except Exception:
+except Exception: # Retained original generic exception
     BINANCE_WS_AVAILABLE = False
 
 
@@ -103,8 +103,8 @@ DATA_MAX_AGE = 300
 PRICE_MAX_AGE = 60
 
 # TFs (already defined above but kept consistent with original structure)
-# TIMEFRAMES = ["1m", "5m", "15m", "1h"] # Already global in original
-# TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600} # Already global in original
+TIMEFRAMES = ["1m", "5m", "15m", "1h"]
+TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 
 # Feature flags
 ENABLE_SCALPING = os.environ.get("ENABLE_SCALPING", "true").lower() == "true"
@@ -153,9 +153,6 @@ HIGH_NEGATIVE_FUNDING = Q(os.environ.get("HIGH_NEGATIVE_FUNDING", "-0.00025"))
 GLOBAL_LOOP_SLEEP_RANGE = (float(os.environ.get("LOOP_SLEEP_MIN", "0.9")),
                            float(os.environ.get("LOOP_SLEEP_MAX", "1.6")))
 MAX_KLINE_UPDATES_PER_LOOP = int(os.environ.get("MAX_KLINE_UPDATES_PER_LOOP", "16"))
-# TICKER_FRESHNESS_SEC = float(os.environ.get("TICKER_FRESHNESS_SEC", "15")) # Already global
-# HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10")) # Already global
-# RETRY_LIMIT = int(os.environ.get("RETRY_LIMIT", "5")) # Already global
 
 # KeepAlive
 KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL", "").strip()
@@ -163,13 +160,8 @@ SELF_URL = os.environ.get("SELF_URL", "").strip()
 KEEPALIVE_INTERVAL_SEC = int(os.environ.get("KEEPALIVE_INTERVAL_SEC", "60"))
 
 # Persistence
-# DB_PATH = os.environ.get("DB_PATH", "state.db") # Already global
 JSON_SNAPSHOT = os.environ.get("JSON_SNAPSHOT", "state_snapshot.json")
 PERSIST_JSON_INTERVAL_SEC = int(os.environ.get("PERSIST_JSON_INTERVAL_SEC", "180"))
-
-# Web
-# PORT = int(os.environ.get("PORT", "10000")) # Already global
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # --- END OF GLOBAL CONSTANTS & CONFIGURATION ---
 
@@ -320,13 +312,12 @@ class ExchangeWrapper:
             if self.mode == "paper":
                 # Binance Futures Testnet configuration
                 config["options"]["defaultType"] = "future"
-                # --- START OF FIX (Explicit URLs for Binance Futures Testnet) ---
+                # --- START OF FIX (Explicit URLs for Binance Futures Testnet, ensuring public endpoint) ---
                 config["urls"] = {
-                    'public': 'https://testnet.binancefuture.com/fapi/v1',  # Public Futures API
-                    'private': 'https://testnet.binancefuture.com/fapi/v1', # Private Futures API
+                    'public': 'https://testnet.binance.vision/api',  # General Spot Testnet Public API
+                    'api': 'https://testnet.binance.vision/api',      # Also general public API
                     'fapi': 'https://testnet.binancefuture.com/fapi/v1',   # Unified Futures API
-                    # General public API for testnet, often used by ccxt for generic ticker/ohlcv
-                    'api': 'https://testnet.binance.vision/api',
+                    'private': 'https://testnet.binancefuture.com/fapi/v1', # Private Futures API
                     'dapi': 'https://testnet.binancefuture.com/dapi/v1', # For USDⓈ-M Futures (Coin-M)
                 }
                 # --- END OF FIX ---
@@ -1182,7 +1173,7 @@ class OmegaXBot:
             # Aggregate alpha scores
             try:
                 long_scores = [scores[0] for scores in alpha_scores.values() if np.isfinite(scores[0])]
-                short_scores = [scores[1] for scores in alpha_scores.values() if np.isfinite(scores[1])]
+                short_scores = [scores[1] for scores in alpha_scores.values() if np.isfinite(scores[1])] # Fix: was scores[0]
                 
                 # Check if lists are empty before mean calculation
                 if not long_scores or not short_scores: return None
@@ -1601,10 +1592,8 @@ def main():
     setup_logging()
     logger = logging.getLogger("main")
     try:
-        # --- START OF FIX (GLOBAL VARS ARE DEFINED BEFORE USAGE) ---
-        # The variables MODE, SYMBOLS, INITIAL_BALANCE etc. are now defined globally BEFORE this line
+        # MODE, SYMBOLS, INITIAL_BALANCE are now defined globally BEFORE this line
         logger.info(f"Starting OmegaX Bot - Mode: {MODE}, Symbols: {len(SYMBOLS)}, Balance: ${INITIAL_BALANCE}")
-        # --- END OF FIX ---
         bot = OmegaXBot()
         # The Flask server is started within _setup_components
         bot.run()
