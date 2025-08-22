@@ -1,34 +1,22 @@
-# Python caches/artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/
-.build/
 dist/
 build/
 .pytest_cache/
 .mypy_cache/
-.coverage
-
-# Logs and local DBs
 *.log
 trading_bot.log
 state.db
 state.db.*
 *.sqlite
-*.sqlite3
-
-# Virtual envs
 .venv/
 venv/
 env/
 ENV/
-
-# Editors/OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-
-# Env files (don’t commit secrets; also don’t upload them to Render)
 .env
 .env.*

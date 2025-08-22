@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-OmegaX Trading Bot - Render-ready main.py (Paper by default)
-- Core infrastructure
-- Strategy and scanning
-- Execution and risk
-- Data management and caching
-- FIXED: safe Decimal conversion in _load_market_info to avoid ConversionSyntax
+OmegaX Trading Bot - Render-ready main.py (Python 3.13.4)
+- Binds a tiny HTTP health server on PORT for Render Web Services
+- Bot runs in a background thread
+- Paper by default; live via env vars (ccxt), with MockExchange fallback
 """
 
 from __future__ import annotations
@@ -14,27 +12,28 @@ import os
 import time
 import random
 import logging
-from threading import RLock, Event as ThreadEvent
+import gc
+import json
+from threading import RLock, Event as ThreadEvent, Thread
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Callable, Any
 from datetime import datetime, timezone
 import sqlite3
 from decimal import Decimal, getcontext, ROUND_DOWN
 from contextlib import contextmanager
-import gc
 
 import numpy as np
 import pandas as pd
 import requests
 
-# Optional CCXT; fallback to mock if missing
+# Optional CCXT; fallback to mock if missing/blocked
 try:
     import ccxt  # type: ignore
     CCXT_AVAILABLE = True
 except Exception:
     CCXT_AVAILABLE = False
 
-# TA libs (install via requirements.txt)
+# TA libs
 from ta.trend import EMAIndicator, MACD, ADXIndicator, SMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.momentum import RSIIndicator
@@ -45,7 +44,6 @@ getcontext().prec = 34
 D = Decimal
 
 def setup_logging():
-    # Console-only logging for Replit
     level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
     logger = logging.getLogger()
     logger.setLevel(level)
@@ -95,7 +93,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 
 # DB
-DB_PATH = os.environ.get("DB_PATH", "state.db")
+DB_PATH = os.environ.get("DB_PATH", "/tmp/state.db")  # default for Render free tier
 
 # Symbols
 SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
@@ -198,7 +196,7 @@ class Notifier:
 class Strategy:
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
-
+    
     def detect_regime(self, df5: pd.DataFrame, df15: pd.DataFrame) -> Tuple[str, bool]:
         try:
             if df5.empty or len(df5) < 50:
@@ -217,7 +215,7 @@ class Strategy:
         except Exception as e:
             self.logger.warning(f"Regime detection failed: {e}")
             return "Unknown", False
-
+    
     def cross_sectional_mom_rank(self, df_map: Dict[str, pd.DataFrame]) -> Dict[str, float]:
         try:
             mom_scores = {}
@@ -239,7 +237,7 @@ class Strategy:
         except Exception as e:
             self.logger.warning(f"Cross-sectional momentum failed: {e}")
             return {}
-
+    
     def alpha_scores(
         self,
         symbol: str,
@@ -262,7 +260,7 @@ class Strategy:
             trend_long = 1.0 if price > ema_fast > ema_slow else 0.0
             trend_short = 1.0 if price < ema_fast < ema_slow else 0.0
             scores["trend"] = (trend_long, trend_short)
-
+            
             # Mean reversion via Bollinger position
             bb = BollingerBands(df5["close"], 20, 2)
             bb_upper = float(bb.bollinger_hband().iloc[-1])
@@ -272,32 +270,32 @@ class Strategy:
             meanrev_long = max(0.0, 1 - bb_position * 2) if bb_position < 0.3 else 0.0
             meanrev_short = max(0.0, bb_position * 2 - 1) if bb_position > 0.7 else 0.0
             scores["meanrev"] = (meanrev_long, meanrev_short)
-
-            # VWAP momentum
+            
+            # VWAP
             vwap = float(VolumeWeightedAveragePrice(df5["high"], df5["low"], df5["close"], df5["volume"]).volume_weighted_average_price().iloc[-1])
             vwap_long = 1.0 if price > vwap * 1.001 else 0.0
             vwap_short = 1.0 if price < vwap * 0.999 else 0.0
             scores["vwap"] = (vwap_long, vwap_short)
-
-            # Donchian breakout
+            
+            # Donchian
             don_high = float(df5["high"].rolling(20).max().iloc[-1])
             don_low = float(df5["low"].rolling(20).min().iloc[-1])
             don_long = 1.0 if price >= don_high * 0.999 else 0.0
             don_short = 1.0 if price <= don_low * 1.001 else 0.0
             scores["donchian"] = (don_long, don_short)
-
+            
             # Cross-sectional momentum
             cs_long = max(0.0, cs_rank) if cs_rank > 0.3 else 0.0
             cs_short = max(0.0, -cs_rank) if cs_rank < -0.3 else 0.0
             scores["xsmom"] = (cs_long, cs_short)
-
-            # Funding rate carry
+            
+            # Funding carry
             carry_threshold = 0.0001
             carry_long = 1.0 if funding_rate < -carry_threshold else 0.0
             carry_short = 1.0 if funding_rate > carry_threshold else 0.0
             scores["carry"] = (carry_long, carry_short)
-
-            # Pair trading vs BTC (aligned returns)
+            
+            # Pair vs BTC
             if not btc_df5.empty and len(btc_df5) >= len(df5):
                 asset_returns = df5["close"].pct_change().tail(20)
                 btc_returns = btc_df5["close"].pct_change().reindex(asset_returns.index)
@@ -321,7 +319,7 @@ class Strategy:
         except Exception as e:
             self.logger.warning(f"Alpha scores calculation failed for {symbol}: {e}")
             return {}
-
+    
     def slope_dir(self, closes: pd.Series) -> str:
         try:
             if len(closes) < 20:
@@ -370,7 +368,7 @@ class Position:
 
     def dir(self) -> D:
         return D("1") if self.side == "long" else D("-1")
-
+    
     def unrealized_pnl(self, current_price: D) -> D:
         return self.dir() * self.qty * (current_price - self.entry)
 
@@ -461,7 +459,7 @@ class RiskManager:
 class MockExchange:
     """
     Offline mock exchange that generates deterministic random-walk OHLCV and basic ticker/order stubs.
-    Helps the bot run on Replit without external network.
+    Helps the bot run without external network.
     """
     def __init__(self, symbols: List[str]):
         self._symbols = list(dict.fromkeys(symbols + (["BTC/USDT"] if "BTC/USDT" not in symbols else [])))
@@ -565,7 +563,7 @@ class ExchangeWrapper:
 
     def _load_market_info(self):
         """
-        FIX: Safely compute Decimal tick/step sizes even if precision fields are missing/invalid.
+        Safely compute Decimal tick/step sizes even if precision fields are missing/invalid.
         """
         for symbol, market in self.exchange.markets.items():
             precision = market.get("precision", {})
@@ -573,27 +571,27 @@ class ExchangeWrapper:
             price_prec = precision.get("price")
             amount_prec = precision.get("amount")
 
-            # --- Price tick size ---
+            # Price tick size
             tick_size = None
             if isinstance(price_prec, int) and price_prec >= 0:
                 tick_size = D(f"1e-{price_prec}")
             elif limits.get("price", {}).get("min") is not None:
                 tick_size = safe_decimal(limits["price"]["min"])
             if not tick_size or tick_size <= 0:
-                tick_size = D("0.01")  # safe fallback
+                tick_size = D("0.01")
 
-            # --- Amount step size ---
+            # Amount step size
             step_size = None
             if isinstance(amount_prec, int) and amount_prec >= 0:
                 step_size = D(f"1e-{amount_prec}")
             elif limits.get("amount", {}).get("min") is not None:
                 step_size = safe_decimal(limits["amount"]["min"])
             if not step_size or step_size <= 0:
-                step_size = D("0.000001")  # conservative fallback
+                step_size = D("0.000001")
 
             self._steps_cache[symbol] = (tick_size, step_size)
 
-            # --- Minimum notional (min cost/value per order) ---
+            # Min notional
             min_cost = limits.get("cost", {}).get("min")
             if not min_cost:
                 info = market.get("info", {})
@@ -1117,7 +1115,7 @@ class OmegaXBot:
         self.exchange = ExchangeWrapper(self.mode)
         self.db_manager = DatabaseManager(DB_PATH)
         self.strategy = Strategy()
-        # Ensure BTC/USDT is available for pair logic
+        # Ensure BTC/USDT available for pair logic
         symbols = list(dict.fromkeys(SYMBOLS + (["BTC/USDT"] if "BTC/USDT" not in SYMBOLS else [])))
         self.data_manager = DataManager(self.exchange, symbols)
         self.indicator_cache = IndicatorCache()
@@ -1427,23 +1425,55 @@ class OmegaXBot:
     def _cleanup(self):
         try:
             self.db_manager.save_risk_state(self.risk_manager)
-            backup_path = f"{DB_PATH}.backup.{int(time.time())}"
-            self.db_manager.create_backup(backup_path)
+            # Ephemeral on free tier; skip backup
             self.logger.info("Cleanup completed")
         except Exception as e:
             self.logger.error(f"Cleanup failed: {e}")
 
-# ====================== ENTRY POINT ======================
+# ====================== ENTRY POINT (with health server) ======================
 def main():
     setup_logging()
+    bot = OmegaXBot()
+    t = Thread(target=bot.run, daemon=True)
+    t.start()
+
+    # Tiny HTTP health server so Render Web Service sees a bound PORT
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in ("/", "/health", "/status"):
+                try:
+                    info = bot.health_monitor.get_health_status()
+                    info.update({
+                        "mode": bot.mode,
+                        "positions": len(bot.portfolio.get_open_positions()),
+                        "risk_off": bot.risk_manager.risk_off
+                    })
+                    payload = json.dumps(info).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except Exception:
+                    self.send_response(500)
+                    self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, fmt, *args):
+            # quiet server logs
+            return
+
+    port = int(os.environ.get("PORT", "10000"))
+    logging.info(f"Health server listening on port {port}")
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
     try:
-        bot = OmegaXBot()
-        bot.run()
-    except KeyboardInterrupt:
-        logging.info("Bot stopped by user")
-    except Exception as e:
-        logging.critical(f"Bot crashed: {e}")
-        raise
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 if __name__ == "__main__":
     main()

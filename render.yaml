@@ -1,6 +1,6 @@
 services:
-  - type: web
-    name: omegax-bot-web
+  - type: worker
+    name: omegax-bot
     env: python
     plan: free
     autoDeploy: true
@@ -9,7 +9,7 @@ services:
       pip install --upgrade pip
       pip install -r requirements.txt
 
-    startCommand: python -u bot.py
+    startCommand: python -u main.py
 
     envVars:
       - key: PYTHON_VERSION
@@ -22,5 +22,3 @@ services:
         value: /tmp/state.db
       - key: LOG_LEVEL
         value: INFO
-
-    healthCheckPath: /
