@@ -1,12 +1,10 @@
-Python 3.13.7 (tags/v3.13.7:bcee1c3, Aug 14 2025, 14:15:11) [MSC v.1944 64 bit (AMD64)] on win32
-Enter "help" below or click "Help" above for more information.
->>> # -*- coding: utf-8 -*-
-... """
-... OmegaX Trading Bot - Compact Version (Python 3.13.4 compatible)
-... All original logic preserved in condensed form
-... """
-... 
-... import os, time, random, logging, signal, threading, sqlite3, gc, json
+# -*- coding: utf-8 -*-
+"""
+OmegaX Trading Bot - Compact Version (Python 3.13.4 compatible)
+All original logic preserved in condensed form
+"""
+
+import os, time, random, logging, signal, threading, sqlite3, gc, json
 ... from threading import RLock, Event as ThreadEvent, Lock
 ... from dataclasses import dataclass
 ... from typing import Dict, List, Optional, Tuple, Any
