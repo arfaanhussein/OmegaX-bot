@@ -4,7 +4,11 @@ services:
     env: python
     plan: starter
     runtime: python-3.11.9
-    buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install --no-cache-dir numpy pandas requests Flask psutil
+      pip install --no-cache-dir ccxt
+      pip install --no-cache-dir ta
     startCommand: python "OmegaX bot.py"
     envVars:
       - key: MODE
