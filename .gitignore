@@ -1,6 +1,6 @@
-echo "*.db
+*.db
 *.log
 *.pyc
 __pycache__/
 .env
-*.backup.*" > .gitignore
+*.backup.*

@@ -1,34 +1,34 @@
-echo "services:
+services:
   - type: web
     name: omegax-trading-bot
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python \"OmegaX bot.py\"
+    startCommand: python "OmegaX bot.py"
     envVars:
       - key: MODE
         value: paper
       - key: INITIAL_BALANCE
-        value: \"3000\"
+        value: "3000"
       - key: RISK_PER_TRADE
-        value: \"0.005\"
+        value: "0.005"
       - key: MAX_TOTAL_RISK
-        value: \"0.06\"
+        value: "0.06"
       - key: MAX_CONCURRENT_POS
-        value: \"8\"
+        value: "8"
       - key: MAX_DRAWDOWN
-        value: \"0.08\"
+        value: "0.08"
       - key: HTTP_TIMEOUT
-        value: \"10\"
+        value: "10"
       - key: RETRY_LIMIT
-        value: \"3\"
+        value: "3"
       - key: SYMBOLS
-        value: \"BTC/USDT,ETH/USDT\"
+        value: "BTC/USDT,ETH/USDT"
       - key: PORT
-        value: \"10000\"
+        value: "10000"
       - key: LOG_LEVEL
-        value: \"INFO\"
+        value: "INFO"
       - key: DB_PATH
-        value: \"/opt/render/project/src/state.db\"
+        value: "/opt/render/project/src/state.db"
     healthCheckPath: /health
-    autoDeploy: false" > render.yaml
+    autoDeploy: false
