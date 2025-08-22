@@ -9,7 +9,7 @@ services:
       pip install --no-cache-dir numpy pandas requests Flask psutil
       pip install --no-cache-dir ccxt
       pip install --no-cache-dir ta
-    startCommand: python "OmegaX bot.py"
+    startCommand: python bot.py
     envVars:
       - key: MODE
         value: paper
