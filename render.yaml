@@ -4,11 +4,12 @@ services:
     runtime: python
     plan: free
     region: oregon
+    healthCheckPath: /ping
     buildCommand: |
+      export PIP_ONLY_BINARY=:all:
       pip install --upgrade pip
       pip install -r requirements.txt
-    startCommand: python omegax_fusion_v23.py
-    healthCheckPath: /ping
+    startCommand: python omegax_fusion_v25.py
     envVars:
       - key: MODE
         value: paper
@@ -32,39 +33,25 @@ services:
         value: "false"
       - key: TELEGRAM_REPORT_INTERVAL_SEC
         value: "900"
-      # KeepAlive pings (optional but recommended)
+      # KeepAlive pings
       - key: SELF_URL
         value: ""   # e.g. https://omegax-fusion.onrender.com/ping
       - key: KEEPALIVE_URL
         value: ""   # e.g. BetterStack/UptimeRobot heartbeat URL
       - key: KEEPALIVE_INTERVAL_SEC
         value: "60"
-      # Persistence (optional, to survive redeploys)
+      # Persistence (local default; remote gist optional)
       - key: PERSIST_MODE
-        value: "local"     # or both/remote if you configure below
+        value: "local"     # local|remote|both; set both to survive redeploys (needs GIST_* below)
       - key: REMOTE_BACKEND
-        value: ""          # s3|gist (set and fill below to enable)
-      # S3 (if using REMOTE_BACKEND=s3)
-      - key: AWS_ACCESS_KEY_ID
-        value: ""
-      - key: AWS_SECRET_ACCESS_KEY
-        value: ""
-      - key: AWS_REGION
-        value: ""
-      - key: S3_BUCKET
-        value: ""
-      - key: S3_KEY
-        value: "state.json"
-      - key: S3_ENDPOINT
-        value: ""
-      # Gist (if using REMOTE_BACKEND=gist)
+        value: "gist"
       - key: GITHUB_TOKEN
         value: ""
       - key: GIST_ID
         value: ""
       - key: GIST_FILENAME
         value: "state.json"
-      # Binance keys (live only)
+      # Binance (live mode only)
       - key: BINANCE_API_KEY
         value: ""
       - key: BINANCE_API_SECRET

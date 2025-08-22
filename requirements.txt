@@ -5,4 +5,3 @@ numpy==1.26.4
 ta==0.11.0
 Flask==3.0.2
 requests==2.32.3
-boto3==1.34.49
