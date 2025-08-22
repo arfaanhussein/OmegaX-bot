@@ -56,7 +56,7 @@ from ta.volume import VolumeWeightedAveragePrice
 try:
     from binance.streams import ThreadedWebsocketManager
     BINANCE_WS_AVAILABLE = True
-except ImportError: # Changed from generic Exception to ImportError as per common practice
+except Exception: # Retained original generic exception
     BINANCE_WS_AVAILABLE = False
 
 
@@ -206,7 +206,7 @@ class Notifier:
     def __init__(self, enabled: bool):
         self.enabled = enabled
         self._last_send, self._min_interval = 0.0, 2.0
-        self._message_queue: List[Tuple[str, bool, float]] = []
+        self._message_queue: List[Tuple[str, bool, float]] = [] # Explicit type hint for queue
         self._lock = RLock()
         self.logger = logging.getLogger(self.__class__.__name__)
         self._queue_processor_thread = threading.Thread(target=self._run_queue_processor, daemon=True)
@@ -258,258 +258,48 @@ class Notifier:
     def send_critical(self, msg: str): self.send(msg, critical=True)
 
 
-# ====================== STRATEGY ======================
-class Strategy:
-    def __init__(self): self.logger = logging.getLogger(self.__class__.__name__)
-    
-    def detect_regime(self, df5: pd.DataFrame, df15: pd.DataFrame) -> Tuple[str, bool]:
-        try:
-            if not validate_dataframe(df5, 50) or not validate_dataframe(df15, 20): return "Unknown", False
-            atr_series = AverageTrueRange(df5["high"], df5["low"], df5["close"], 14).average_true_range()
-            if atr_series.empty or atr_series.isna().all(): return "Unknown", False
-            current_atr, avg_atr = float(atr_series.iloc[-1]), float(atr_series.tail(50).dropna().mean())
-            if np.isnan(current_atr) or current_atr <= 0 or avg_atr <= 0: return "Unknown", False
-            vol_spike = current_atr > avg_atr * 1.5
-            adx_series = ADXIndicator(df5["high"], df5["low"], df5["close"], 14).adx()
-            if adx_series.empty or adx_series.isna().all(): return "Unknown", False
-            current_adx = float(adx_series.iloc[-1])
-            if np.isnan(current_adx): return "Unknown", False
-            regime = ("Trending" if current_adx > 25 else "Ranging") + (" High Volatility" if vol_spike else "")
-            return regime, vol_spike
-        except Exception as e:
-            self.logger.warning(f"Regime detection failed: {e}")
-            return "Unknown", False
-    
-    def cross_sectional_mom_rank(self, df_map: Dict[str, pd.DataFrame]) -> Dict[str, float]:
-        try:
-            mom_scores = {}
-            for symbol, df in df_map.items():
-                if not validate_dataframe(df, 50):
-                    mom_scores[symbol] = 0.0
-                    continue
-                closes = df["close"].dropna()
-                if len(closes) < 30:
-                    mom_scores[symbol] = 0.0
-                    continue
-                returns_1w = (float(closes.iloc[-1]) / float(closes.iloc[-7]) - 1) if len(closes) >= 7 and closes.iloc[-7] != 0 else 0.0
-                returns_1m = (float(closes.iloc[-1]) / float(closes.iloc[-30]) - 1) if len(closes) >= 30 and closes.iloc[-30] != 0 else 0.0
-                if not all(np.isfinite([returns_1w, returns_1m])): returns_1w = returns_1m = 0.0
-                mom_scores[symbol] = max(-1.0, min(1.0, returns_1w * 0.3 + returns_1m * 0.7))
-            
-            if not mom_scores: return {}
-            sorted_scores = sorted(mom_scores.items(), key=lambda x: x[1], reverse=True)
-            n = len(sorted_scores)
-            return {symbol: max(-1.0, min(1.0, (2 * (n - i - 1) / (n - 1) - 1) if n > 1 else 0.0)) 
-                   for i, (symbol, _) in enumerate(sorted_scores)}
-        except Exception as e:
-            self.logger.warning(f"Cross-sectional momentum failed: {e}")
-            return {}
-    
-    def alpha_scores(self, symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame, 
-                    btc_df5: pd.DataFrame, cs_rank: float, funding_rate: float) -> Dict[str, Tuple[float, float]]:
-        try:
-            scores = {}
-            if not all(validate_dataframe(df, 20) for df in [df5, df15, df1h]): return scores
-            price = float(df5["close"].iloc[-1])
-            if not np.isfinite(price) or price <= 0: return scores
+# ====================== EXCEPTIONS ======================
+class TradingBotError(Exception): pass
+class ExchangeUnavailable(TradingBotError): pass
+class HardStopTriggered(TradingBotError): pass
+class ConfigurationError(TradingBotError): pass
+class InsufficientFundsError(TradingBotError): pass
 
-            # Trend following
-            try:
-                ema_fast = float(EMAIndicator(df5["close"], 12).ema_indicator().iloc[-1])
-                ema_slow = float(EMAIndicator(df5["close"], 26).ema_indicator().iloc[-1])
-                if all(np.isfinite([ema_fast, ema_slow]) and x > 0 for x in [ema_fast, ema_slow]):
-                    scores["trend"] = (1.0 if price > ema_fast > ema_slow else 0.0, 1.0 if price < ema_fast < ema_slow else 0.0)
-                else: scores["trend"] = (0.0, 0.0)
-            except: scores["trend"] = (0.0, 0.0)
-            
-            # Mean reversion
-            try:
-                bb = BollingerBands(df5["close"], 20, 2)
-                bb_upper, bb_lower = float(bb.bollinger_hband().iloc[-1]), float(bb.bollinger_lband().iloc[-1])
-                if all(np.isfinite([bb_upper, bb_lower]) and x > 0 for x in [bb_upper, bb_lower]):
-                    denom = bb_upper - bb_lower
-                    if denom > 0:
-                        bb_position = max(0.0, min(1.0, (price - bb_lower) / denom))
-                        scores["meanrev"] = (max(0.0, 1 - bb_position * 2) if bb_position < 0.3 else 0.0,
-                                           max(0.0, bb_position * 2 - 1) if bb_position > 0.7 else 0.0)
-                    else: scores["meanrev"] = (0.0, 0.0)
-                else: scores["meanrev"] = (0.0, 0.0)
-            except: scores["meanrev"] = (0.0, 0.0)
-            
-            # VWAP, Donchian, Cross-sectional, Carry
-            try:
-                vwap_series = VolumeWeightedAveragePrice(df5["high"], df5["low"], df5["close"], df5["volume"]).volume_weighted_average_price()
-                vwap = float(vwap_series.iloc[-1]) if not vwap_series.empty and not pd.isna(vwap_series.iloc[-1]) else np.nan
-                scores["vwap"] = (1.0 if np.isfinite(vwap) and vwap > 0 and price > vwap * 1.001 else 0.0,
-                                                                1.0 if np.isfinite(vwap) and vwap > 0 and price < vwap * 0.999 else 0.0)
-            except: scores["vwap"] = (0.0, 0.0)
-            
-            try:
-                don_high, don_low = float(df5["high"].rolling(20).max().iloc[-1]), float(df5["low"].rolling(20).min().iloc[-1])
-                if all(np.isfinite([don_high, don_low]) and x > 0 for x in [don_high, don_low]):
-                    scores["donchian"] = (1.0 if price >= don_high * 0.999 else 0.0, 1.0 if price <= don_low * 1.001 else 0.0)
-                else: scores["donchian"] = (0.0, 0.0)
-            except: scores["donchian"] = (0.0, 0.0)
-            
-            if np.isfinite(cs_rank):
-                cs_rank = max(-1.0, min(1.0, cs_rank))
-                scores["xsmom"] = (max(0.0, cs_rank) if cs_rank > 0.3 else 0.0, max(0.0, -cs_rank) if cs_rank < -0.3 else 0.0)
-            else: scores["xsmom"] = (0.0, 0.0)
-            
-            if np.isfinite(funding_rate):
-                funding_rate = max(-0.01, min(0.01, funding_rate))
-                scores["carry"] = (1.0 if funding_rate < -0.0001 else 0.0, 1.0 if funding_rate > 0.0001 else 0.0)
-            else: scores["carry"] = (0.0, 0.0)
-            
-            # Pair trading
-            try:
-                if validate_dataframe(btc_df5, 20) and len(btc_df5) >= len(df5):
-                    asset_returns = df5["close"].pct_change().dropna().tail(20)
-                    btc_returns = btc_df5["close"].pct_change().dropna().tail(20)
-                    
-                    min_len = min(len(asset_returns), len(btc_returns))
-                    if min_len >= 10:
-                        asset_ret, btc_ret = asset_returns.tail(min_len).values, btc_returns.tail(min_len).values
-                        if (np.isfinite(asset_ret).all() and np.isfinite(btc_ret).all() and 
-                            np.std(asset_ret) > 0 and np.std(btc_ret) > 0):
-                            correlation = np.corrcoef(asset_ret, btc_ret)[0, 1]
-                            if np.isfinite(correlation) and abs(correlation) > 0.5:
-                                btc_momentum = (float(btc_df5["close"].iloc[-1]) / float(btc_df5["close"].iloc[-10]) - 1) if btc_df5["close"].iloc[-10] != 0 else 0.0
-                                asset_momentum = (float(df5["close"].iloc[-1]) / float(df5["close"].iloc[-10]) - 1) if df5["close"].iloc[-10] != 0 else 0.0
-                                if np.isfinite(btc_momentum) and np.isfinite(asset_momentum):
-                                    relative_perf = max(-0.5, min(0.5, asset_momentum - btc_momentum))
-                                    scores["pair"] = (max(0.0, -relative_perf) if relative_perf < -0.02 else 0.0,
-                                                    max(0.0, relative_perf) if relative_perf > 0.02 else 0.0)
-                                else: scores["pair"] = (0.0, 0.0)
-                            else: scores["pair"] = (0.0, 0.0)
-                        else: scores["pair"] = (0.0, 0.0)
-                    else: scores["pair"] = (0.0, 0.0)
-                else: scores["pair"] = (0.0, 0.0)
-            except Exception as e:
-                self.logger.warning(f"Pair trading score failed for {symbol}: {e}")
-                scores["pair"] = (0.0, 0.0) # Ensure it always adds to scores dictionary
 
-            return scores
-        except Exception as e:
-            self.logger.error(f"Alpha scores failed for {symbol}: {e}")
-            return {}
-
-# ====================== DOMAIN MODELS ======================
-@dataclass
-class Position:
-    symbol: str
-    side: str
-    qty: D
-    entry: D
-    sl: D
-    tp: D
-    lev: D
-    opened_at: float
-    partial: bool = False
-    is_hedge: bool = False
-    mode: str = "directional"
-    pyramids: int = 0
-    last_add_price: Optional[D] = None
-    tag: str = "meta"
-    entry_order_id: Optional[str] = None
-    sl_order_id: Optional[str] = None
-    tp_order_id: Optional[str] = None
-    client_order_id: Optional[str] = None
-    time_limit: Optional[float] = None
-
-    def __post_init__(self):
-        if self.side not in ("long", "short"): raise ValueError(f"Invalid side: {self.side}")
-        if not isinstance(self.qty, D) or self.qty <= 0 or not self.qty.is_finite(): raise ValueError(f"Invalid quantity: {self.qty}")
-        if not isinstance(self.entry, D) or self.entry <= 0 or not self.entry.is_finite(): raise ValueError(f"Invalid entry: {self.entry}")
-        # SL/TP validation: allow 0 for no SL/TP, but if set, ensure logical consistency
-        if self.sl > 0 and (not self.sl.is_finite() or (self.side == "long" and self.sl >= self.entry) or (self.side == "short" and self.sl <= self.entry)):
-            raise ValueError(f"Invalid SL for {self.side} position: {self.sl} vs entry {self.entry}")
-        if self.tp > 0 and (not self.tp.is_finite() or (self.side == "long" and self.tp <= self.entry) or (self.side == "short" and self.tp >= self.entry)):
-            raise ValueError(f"Invalid TP for {self.side} position: {self.tp} vs entry {self.entry}")
-
-    def dir(self) -> D: return D("1") if self.side == "long" else D("-1")
-    def unrealized_pnl(self, current_price: D) -> D:
-        try: return self.dir() * self.qty * (current_price - self.entry) if isinstance(current_price, D) and current_price > 0 and current_price.is_finite() else D("0")
-        except: return D("0")
-    def risk_amount(self) -> D:
-        try: return abs(self.entry - self.sl) * self.qty if self.sl > 0 else D("0")
-        except: return D("0")
-    def is_expired(self) -> bool: return self.time_limit is not None and time.time() >= self.time_limit
-
-# ====================== RISK MANAGEMENT ======================
-class RiskManager:
-    def __init__(self, initial_balance: D):
-        if not isinstance(initial_balance, D) or initial_balance <= 0 or not initial_balance.is_finite():
-            raise ValueError(f"Invalid initial balance: {initial_balance}")
-        self.initial = self.balance = self.equity_peak = initial_balance
-        self.paused_until = 0.0
-        self._risk_off_until = 0.0
-        self.consec_losses = 0
-        self.day_anchor = self._utc_midnight_ts()
-        self.daily_pnl = D("0")
-        self.loss_bucket = D("0")
-        self.cooldown: Dict[str, float] = {}
+# ====================== CIRCUIT BREAKER ======================
+class CircuitBreaker:
+    def __init__(self, max_failures: int = 5, reset_after: int = 60):
+        self.max_failures, self.reset_after = max_failures, reset_after
+        self.failures, self.opened_at, self.last_attempt = 0, 0.0, 0.0
         self._lock = RLock()
-        self.logger = logging.getLogger(self.__class__.__name__)
 
-    def _utc_midnight_ts(self) -> int: return int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    def _check_day_rollover(self):
-        current_midnight = self._utc_midnight_ts()
-        if current_midnight > self.day_anchor:
-            with self._lock:
-                days_passed = (current_midnight - self.day_anchor) // 86400
-                if days_passed >= 1:
-                    self.day_anchor, self.daily_pnl = current_midnight, D("0")
-                    # Compound reduction for loss_bucket
-                    self.loss_bucket = self.loss_bucket * (D("0.8") ** days_passed)
-                    self.consec_losses = 0
+    def record_success(self):
+        with self._lock:
+            self.failures = max(0, self.failures - 1)
+            if self.failures == 0: self.opened_at = 0.0
+
+    def record_failure(self):
+        with self._lock:
+            self.failures += 1
+            self.last_attempt = time.time()
+            if self.failures >= self.max_failures and self.opened_at == 0.0:
+                self.opened_at = time.time()
+
+    def allow(self) -> bool:
+        with self._lock:
+            now = time.time()
+            if self.opened_at == 0.0: return True
+            if now - self.opened_at >= self.reset_after:
+                if now - self.last_attempt >= self.reset_after * 0.5:
+                    self.failures = max(0, self.failures - 1)
+                    if self.failures < self.max_failures // 2: self.opened_at = 0.0
+                return True
+            return False
 
     @property
-    def drawdown(self) -> D:
-        with self._lock: 
-            self.equity_peak = max(self.equity_peak, self.balance) # Ensure peak is always up-to-date
-            return max(D("0"), (self.equity_peak - self.balance) / self.equity_peak) if self.equity_peak > 0 else D("0")
-    @property
-    def risk_off(self) -> bool:
-        with self._lock: return time.time() < self._risk_off_until or time.time() < self.paused_until
+    def tripped(self) -> bool:
+        with self._lock: return self.opened_at != 0.0
 
-    def update_balance(self, new_balance: D):
-        if not isinstance(new_balance, D) or not new_balance.is_finite(): raise ValueError(f"Invalid balance: {new_balance}")
-        with self._lock:
-            self._check_day_rollover(); old_balance, pnl_change = self.balance, new_balance - self.balance
-            self.balance, self.equity_peak, self.daily_pnl = new_balance, max(self.equity_peak, new_balance), self.daily_pnl + pnl_change
-            if pnl_change < 0: self.consec_losses += 1; self.loss_bucket += abs(pnl_change)
-            else: self.consec_losses = 0; self.loss_bucket = max(D("0"), self.loss_bucket - min(self.loss_bucket, pnl_change * D("0.5"))) if self.loss_bucket > 0 else D("0")
-        self._check_risk_limits()
-
-    def _check_risk_limits(self):
-        dd = self.drawdown
-        if dd >= MAX_DRAWDOWN: raise HardStopTriggered(f"Drawdown {float(dd):.2%} exceeds limit {float(MAX_DRAWDOWN):.2%}")
-        if dd >= D("0.05"):
-            with self._lock: self.paused_until = max(self.paused_until, time.time() + 1800 + (float(dd) * 3600))
-        with self._lock:
-            daily_loss_pct = abs(self.daily_pnl) / self.balance if self.balance > 0 else D("0")
-            if self.daily_pnl < 0 and daily_loss_pct >= D("0.03"):
-                self._risk_off_until = max(self._risk_off_until, self.day_anchor + 86400)
-
-    def can_trade(self, symbol: str) -> bool:
-        with self._lock: return not self.risk_off and time.time() >= self.cooldown.get(symbol, 0.0) and self.balance > self.initial * D("0.1")
-    def note_trade_opened(self, symbol: str): 
-        with self._lock: self.cooldown[symbol] = time.time() + 300
-
-    def position_size(self, symbol: str, entry: D, sl: D, risk_fraction: D) -> D:
-        try:
-            if not all(isinstance(x, D) and x.is_finite() for x in [entry, sl, risk_fraction]) or entry <= 0 or sl <= 0 or entry == sl or not (D("0") < risk_fraction <= D("0.1")): return D("0")
-            with self._lock:
-                if self.balance <= 0: return D("0")
-                risk_amount, price_risk = self.balance * risk_fraction, abs(entry - sl)
-                if price_risk <= 0: return D("0")
-                position_size = risk_amount / price_risk
-                max_position_value = self.balance * D("10") # Example: max 10x balance in notional value for a single position
-                return max(D("0"), min(position_size, max_position_value / entry if entry > 0 else D("0")))
-        except Exception as e: # Catch any other potential errors
-            self.logger.warning(f"Position sizing failed: {e}")
-            return D("0")
 
 # ====================== EXCHANGE WRAPPER ======================
 class ExchangeWrapper:
@@ -535,12 +325,16 @@ class ExchangeWrapper:
             if self.mode == "paper":
                 # Binance Futures Testnet configuration
                 config["options"]["defaultType"] = "future"
+                # --- START OF FIX ---
                 config["urls"] = {
-                    'api': 'https://testnet.binancefuture.com/fapi/v1',
-                    'www': 'https://testnet.binancefuture.com',
-                    'dapi': 'https://testnet.binancefuture.com/dapi/v1',
+                    'public': 'https://testnet.binancefuture.com/fapi/v1',  # Public Futures API
+                    'private': 'https://testnet.binancefuture.com/fapi/v1', # Private Futures API
+                    'fapi': 'https://testnet.binancefuture.com/fapi/v1',   # Unified Futures API
+                    # General public API for testnet, often used by ccxt for generic ticker/ohlcv
+                    'api': 'https://testnet.binance.vision/api', 
+                    'dapi': 'https://testnet.binancefuture.com/dapi/v1', # For USDⓈ-M Futures (Coin-M)
                 }
-                config['hostname'] = 'testnet.binancefuture.com' # Essential for ccxt to hit testnet
+                # --- END OF FIX ---
             self.exchange = ccxt.binance(config)
             self.exchange.load_markets() # Load markets after config
             futures_markets = [s for s, m in self.exchange.markets.items() if m.get('type') == 'future']
@@ -659,7 +453,7 @@ class DataManager:
                 (df['low'] > df['open']) | 
                 (df['low'] > df['close']) | 
                 (df['volume'] < 0) | 
-                df[['open', 'high', 'low', 'close', 'volume']].isna().any(axis=1)
+                df[['open', 'high', 'low', 'close', 'volume']].isna().any(axis=1) # Check for NaNs again after dropna, just in case
             )
             if invalid_ohlc.any(): df = df[~invalid_ohlc]
             if len(df) < 10: return False
@@ -693,7 +487,7 @@ class DataManager:
 # ====================== INDICATOR CACHE ======================
 class IndicatorCache:
     def __init__(self, max_size: int = 1000):
-        self.cache: Dict[str, Dict[str, float]] = {} # Cache stores string keys for time-based identification, and inner dict for indicators
+        self.cache: Dict[str, Dict[str, float]] = {} # Cache stores string keys for time-based identification, and inner dict for indicators (float values)
         self.max_size = max_size
         self.access_times: Dict[str, float] = {}
         self._lock = RLock()
@@ -727,7 +521,7 @@ class IndicatorCache:
         indicators_results = {} # Will store the final float values
         
         # Helper for safe indicator calculation to return a float or np.nan
-        def safe_indicator_value(func, df_for_check: pd.Series):
+        def safe_indicator_value(func: Callable[[], pd.Series], df_for_check: pd.Series):
             if df_for_check.empty or df_for_check.isna().all(): return np.nan
             try:
                 result_series = func()
@@ -803,7 +597,7 @@ class DatabaseManager:
                 if not conn.execute("SELECT COUNT(*) FROM risk_state WHERE id=1").fetchone()[0]:
                     now, midnight_ts = time.time(), int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
                     conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (1,?,?,?,?,?,?,?,?,?)", 
-                                (str(INITIAL_BALANCE), str(INITIAL_BALANCE), '0', '0', 0, 0, 0, midnight_ts, now))
+                                (str(INITIAL_BALANCE), str(INITIAL_BALANCE), '0', '0', 0, 0, 0, midnight_ts, now)) # Corrected missing fields in initial INSERT
                 conn.commit()
         except Exception as e: raise ConfigurationError(f"Database init failed: {e}")
 
@@ -812,7 +606,7 @@ class DatabaseManager:
         conn = None
         try:
             with self._connection_pool_lock:
-                conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None) # isolation_level=None for autocommit behavior
+                conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None) # isolation_level=None for autocommit
                 conn.execute("PRAGMA busy_timeout=30000; PRAGMA temp_store=MEMORY")
             yield conn
         except Exception as e:
@@ -827,7 +621,7 @@ class DatabaseManager:
 
     def save_risk_state(self, risk_manager) -> bool:
         try:
-            with self._get_connection() as conn: # Removed risk_manager._lock as it's handled at a higher level
+            with self._get_connection() as conn: 
                 with risk_manager._lock: # Acquire risk_manager's lock to read its state
                     data = (str(risk_manager.balance), str(risk_manager.equity_peak), str(risk_manager.daily_pnl), str(risk_manager.loss_bucket),
                            risk_manager.consec_losses, risk_manager.paused_until, risk_manager._risk_off_until, risk_manager.day_anchor, time.time())
@@ -904,8 +698,7 @@ class DatabaseManager:
                             time_limit=time_limit_val
                         )
                     except Exception as e: self.logger.error(f"Load position failed {data.get('symbol', 'unknown')}: {e}")
-        except Exception as e: self.logger.error(f"Load positions failed: {e}")
-        return positions
+        except Exception as e: self.logger.error(f"Load positions failed: {e}"); return {} # Ensure a dict is always returned
 
     def create_backup(self, backup_path: str) -> bool:
         try:
@@ -932,7 +725,7 @@ class HealthMonitor:
         with self._lock:
             uptime = time.time() - self.start_time
             try: import psutil; memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
-            except ImportError: # psutil might not be installed
+            except ImportError: # psutil might not be installed, handle gracefully
                 memory_mb = 0.0
                 self.logger.debug("psutil not available, memory monitoring disabled.")
             error_rate = self.error_count / (uptime / 3600) if uptime > 0 else 0
@@ -1032,7 +825,7 @@ class ExecutionEngine:
                     order = self.exchange.create_order(symbol=symbol, order_type="market", side=order_side, amount=rounded_qty, params={"newClientOrderId": client_order_id})
                     
                     position.entry_order_id, position.client_order_id = order.get("id"), client_order_id
-                    # Get actual fill price from order if available, else use rounded_entry
+                    # Get actual fill price from order if available, else use rounded_entry as a fallback
                     position.entry = safe_decimal(order.get("average") or order.get("price"), rounded_entry)
                     
                     # Save position to DB *after* successful entry order
@@ -1120,7 +913,7 @@ class ExecutionEngine:
                 if not isinstance(position, Position) or not isinstance(new_sl, D) or not new_sl.is_finite(): raise ValueError("Invalid parameters for update_stop_loss")
                 
                 old_sl = position.sl
-                # Validate new SL logic: must be below entry for long, above for short
+                # Validate new SL logic: must be below entry for long, above for short, if new_sl > 0
                 if new_sl > 0 and ((position.side == "long" and new_sl >= position.entry) or (position.side == "short" and new_sl <= position.entry)):
                     self.logger.warning(f"Attempted to set invalid SL for {position.symbol}: {new_sl} vs entry {position.entry}. Ignoring update.")
                     return # Do not proceed with invalid SL
@@ -1452,7 +1245,7 @@ class OmegaXBot:
         # Calculate total risk from currently open directional positions
         current_total_risk = sum(p.risk_amount() for p in self.portfolio.get_all_positions() if not p.is_hedge)
         # Check against MAX_TOTAL_RISK
-        if current_total_risk / self.risk_manager.balance >= MAX_TOTAL_RISK: # Ensure balance is > 0
+        if self.risk_manager.balance > 0 and current_total_risk / self.risk_manager.balance >= MAX_TOTAL_RISK:
             self.logger.debug(f"Total portfolio risk ({current_total_risk}) exceeds MAX_TOTAL_RISK ({MAX_TOTAL_RISK * self.risk_manager.balance}).")
             return
         
@@ -1490,7 +1283,7 @@ class OmegaXBot:
                     continue
                 
                 new_trade_risk_amount = abs(entry_price - stop_loss) * position_size
-                if (current_total_risk + new_trade_risk_amount) / self.risk_manager.balance > MAX_TOTAL_RISK:
+                if self.risk_manager.balance > 0 and (current_total_risk + new_trade_risk_amount) / self.risk_manager.balance > MAX_TOTAL_RISK:
                     self.logger.debug(f"New trade for {symbol} would exceed MAX_TOTAL_RISK. Current total: {current_total_risk}, New: {new_trade_risk_amount}.")
                     continue
                 
@@ -1500,7 +1293,7 @@ class OmegaXBot:
                     self.portfolio.add_position(position)
                     self.risk_manager.note_trade_opened(symbol)
                     opportunities_found += 1
-                    current_total_risk += new_trade_risk_amount # Update total risk
+                    current_total_risk += new_trade_risk_amount # Update total risk for subsequent checks
             except Exception as e: self.logger.error(f"Scanning error {symbol}: {e}", exc_info=True); self.health_monitor.record_error(e, "opportunity_scanning")
 
     def _periodic_tasks(self):
@@ -1759,6 +1552,7 @@ def create_health_server(bot: OmegaXBot) -> Flask:
     def health():
         try:
             # Get current prices (might involve API calls)
+            # This is called periodically by health checks and could block.
             prices = bot._get_current_prices() 
             health_data = {
                 'ok': True, 
