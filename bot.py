@@ -36,12 +36,12 @@ import random
 import logging
 import threading
 from threading import RLock, Event as ThreadEvent, Lock
-from dataclasses import dataclass, field # field is used later, must be imported
-from typing import Dict, List, Optional, Tuple, Any, Callable # Callable is used for type hints
-from queue import Queue, Empty # Queue and Empty are used for queues
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Any, Callable
+from queue import Queue, Empty
 from datetime import datetime, timezone
 import sqlite3
-from decimal import Decimal, getcontext, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP # ROUND_UP is used later
+from decimal import Decimal, getcontext, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from contextlib import contextmanager
 import numpy as np
 import pandas as pd
@@ -50,13 +50,14 @@ import ccxt
 from flask import Flask, jsonify
 from ta.trend import EMAIndicator, MACD, ADXIndicator, SMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
-from ta.momentum import RSIIndicator, StochasticOscillator # StochasticOscillator is used
+from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volume import VolumeWeightedAveragePrice
+import gc # Added gc import
 
 try:
     from binance.streams import ThreadedWebsocketManager
     BINANCE_WS_AVAILABLE = True
-except Exception: # Retained original generic exception
+except Exception:
     BINANCE_WS_AVAILABLE = False
 
 
@@ -142,9 +143,14 @@ HIGH_NEGATIVE_FUNDING = Q(os.environ.get("HIGH_NEGATIVE_FUNDING", "-0.00025"))
 GLOBAL_LOOP_SLEEP_RANGE = (float(os.environ.get("LOOP_SLEEP_MIN", "0.9")),
                            float(os.environ.get("LOOP_SLEEP_MAX", "1.6")))
 MAX_KLINE_UPDATES_PER_LOOP = int(os.environ.get("MAX_KLINE_UPDATES_PER_LOOP", "16"))
+# --- START OF GLOBAL CONSTANTS MOVED UP ---
 TICKER_FRESHNESS_SEC = float(os.environ.get("TICKER_FRESHNESS_SEC", "15"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
 RETRY_LIMIT = int(os.environ.get("RETRY_LIMIT", "5"))
+DATA_MAX_AGE = 300 # Moved up
+PRICE_MAX_AGE = 60 # Moved up
+# --- END OF GLOBAL CONSTANTS MOVED UP ---
+
 
 # Telegram
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
@@ -325,7 +331,7 @@ class ExchangeWrapper:
             if self.mode == "paper":
                 # Binance Futures Testnet configuration
                 config["options"]["defaultType"] = "future"
-                # --- START OF FIX ---
+                # --- START OF FIX (Explicit URLs for Binance Futures Testnet) ---
                 config["urls"] = {
                     'public': 'https://testnet.binancefuture.com/fapi/v1',  # Public Futures API
                     'private': 'https://testnet.binancefuture.com/fapi/v1', # Private Futures API
@@ -474,13 +480,13 @@ class DataManager:
         df = self.data.get(symbol, {}).get(timeframe, pd.DataFrame())
         return df.copy() if not df.empty else df
 
-    def is_data_fresh(self, symbol: str, timeframe: str, max_age: int = DATA_MAX_AGE) -> bool:
+    def is_data_fresh(self, symbol: str, timeframe: str, max_age: int = DATA_MAX_AGE) -> bool: # DATA_MAX_AGE is now globally defined
         return is_data_fresh(self.last_update.get(symbol, {}).get(timeframe, 0), max_age)
 
     def get_latest_price(self, symbol: str) -> Optional[D]:
         for tf in ["1m", "5m", "15m"]:
             df = self.get_data(symbol, tf)
-            if not df.empty and self.is_data_fresh(symbol, tf, PRICE_MAX_AGE):
+            if not df.empty and self.is_data_fresh(symbol, tf, PRICE_MAX_AGE): # PRICE_MAX_AGE is now globally defined
                 return safe_decimal(df["close"].iloc[-1])
         return None
 
