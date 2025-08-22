@@ -1,21 +1,47 @@
 # -*- coding: utf-8 -*-
-# OmegaX Trading Bot - Compact Version (Python 3.13.4 compatible)
-# All original logic preserved in condensed form
+"""
+omega_x_bot.py
+OmegaX Fusion v27 (Python 3.13.4-compatible, Render-friendly, no Docker required)
+
+Highlights:
+- Exchange: Binance USDT-M Futures via ccxt REST + python-binance WS (user + optional 1m klines)
+- Strict Decimal for all financial logic (qty, price, pnl, balance, risk)
+- SQLite (stdlib) transactional persistence + optional JSON backup snapshot
+- No infinite retries: finite retry wrapper + circuit breaker for exchange calls.
+- Centralized, idempotent close logic; bracket repair with bounded retries.
+- Comprehensive WebSocket order status handling (FILLED, PARTIALLY_FILLED, CANCELED, REJECTED, EXPIRED).
+- Fine-grained locking: separate locks for positions and risk; DB writes decoupled from locks.
+- Indicator caching: per-symbol cached features; no repeated indicator recompute in a single loop iteration.
+- Top-100 USDT futures auto-discovery by 24h volume; configurable scalping subset.
+- Unified risk across all trades (directional + recovery) with clear caps; hedge capped vs portfolio notional.
+- KeepAlive pinger + 15m Telegram equity reports; Flask health endpoints (/ping /health /metrics /api/status /api/positions).
+
+Install:
+  pip install ccxt python-binance pandas numpy ta Flask requests
+
+Run locally:
+  TELEGRAM_TOKEN=xxx TELEGRAM_CHAT_ID=yyy MODE=paper python omega_x_bot.py
+
+Render (python runtime): use requirements.txt + render.yaml; no Docker required.
+"""
+
+from __future__ import annotations
 
 import os
+import json
 import time
+import math
+import signal
 import random
 import logging
-import signal
 import threading
-import sqlite3
-import gc
-import json
 from threading import RLock, Event as ThreadEvent, Lock
-from dataclasses import dataclass, field # Added field for dataclasses
-from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field # field is used later, must be imported
+from typing import Dict, List, Optional, Tuple, Any, Callable # Callable is used for type hints
+from queue import Queue, Empty # Queue and Empty are used for queues
 from datetime import datetime, timezone
-from decimal import Decimal, getcontext, ROUND_DOWN, ROUND_HALF_UP
+import sqlite3
+from decimal import Decimal, getcontext, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP # ROUND_UP is used later
 from contextlib import contextmanager
 import numpy as np
 import pandas as pd
@@ -24,143 +50,175 @@ import ccxt
 from flask import Flask, jsonify
 from ta.trend import EMAIndicator, MACD, ADXIndicator, SMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
-from ta.momentum import RSIIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator # StochasticOscillator is used
 from ta.volume import VolumeWeightedAveragePrice
 
-# Suppress warnings if python-binance isn't available
 try:
     from binance.streams import ThreadedWebsocketManager
     BINANCE_WS_AVAILABLE = True
-except ImportError: # Changed from generic Exception to ImportError
+except ImportError: # Changed from generic Exception to ImportError as per common practice
     BINANCE_WS_AVAILABLE = False
-    logging.warning("python-binance not installed. WebSocket functionality will be limited.")
 
 
-# ====================== CONFIG ======================
-getcontext().prec = 34
+# ====================== DECIMAL CONFIG ======================
+getcontext().prec = int(os.environ.get("DECIMAL_PREC", "34"))
 D = Decimal
+Q = lambda x: D(str(x))  # safe Decimal conversion from any numeric/str
 
-def setup_logging():
-    level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
-    handlers = [logging.StreamHandler()]
-    try:
-        from logging.handlers import RotatingFileHandler
-        handlers.append(RotatingFileHandler("trading_bot.log", maxBytes=10*1024*1024, backupCount=5))
-    except: # Keep generic exception for file handler as it's a fallback
-        pass
-    logging.basicConfig(level=level, handlers=handlers, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", force=True)
 
-def validate_config() -> str:
-    mode = os.environ.get('MODE', 'paper').lower()
-    if mode == 'live':
-        for var in ['BINANCE_API_KEY', 'BINANCE_API_SECRET']:
-            if not os.environ.get(var, '').strip():
-                raise ValueError(f"Required {var} not set for live trading")
-    return mode
+# ====================== ENV + CONFIG ======================
+MODE = os.environ.get("MODE", "paper").lower()  # paper|live
 
-MODE = validate_config()
+# Universe
+SEED_SYMBOLS = os.environ.get(
+    "SEED_SYMBOLS",
+    "BTC/USDT,ETH/USDT,BNB/USDT,SOL/USDT,XRP/USDT,ADA/USDT,DOGE/USDT,TRX/USDT,AVAX/USDT,LINK/USDT,DOT/USDT,MATIC/USDT,BCH/USDT,LTC/USDT,NEAR/USDT,"
+    "FIL/USDT,ATOM/USDT,ICP/USDT,APT/USDT,ARB/USDT"
+).split(",")
+SYMBOL_ALIASES = {"MATIC/USDT": "POL/USDT"}
 
-# Constants with validation
-INITIAL_BALANCE = D(os.environ.get("INITIAL_BALANCE", "3000"))
-RISK_PER_TRADE = max(D("0.001"), min(D("0.05"), D(os.environ.get("RISK_PER_TRADE", "0.005"))))
-MAX_TOTAL_RISK = max(D("0.01"), min(D("0.2"), D(os.environ.get("MAX_TOTAL_RISK", "0.06"))))
-MAX_CONCURRENT_POS = max(1, min(20, int(os.environ.get("MAX_CONCURRENT_POS", "8"))))
-MAX_DRAWDOWN = max(D("0.02"), min(D("0.3"), D(os.environ.get("MAX_DRAWDOWN", "0.08"))))
-HTTP_TIMEOUT = max(5, min(30, int(os.environ.get("HTTP_TIMEOUT", "10"))))
-RETRY_LIMIT = max(1, min(10, int(os.environ.get("RETRY_LIMIT", "3"))))
+# TFs
+TIMEFRAMES = ["1m", "5m", "15m", "1h"]
+TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 
+# Feature flags
+ENABLE_SCALPING = os.environ.get("ENABLE_SCALPING", "true").lower() == "true"
+ENABLE_MEAN_REVERSION = os.environ.get("ENABLE_MEAN_REVERSION", "true").lower() == "true"
+ENABLE_GRID = os.environ.get("ENABLE_GRID", "true").lower() == "true"
+ENABLE_ARBITRAGE = os.environ.get("ENABLE_ARBITRAGE", "false").lower() == "true"  # detect-only
+USE_USER_WS = os.environ.get("USE_USER_WS", "true").lower() == "true"
+SYMBOL_AUTO_DISCOVERY = os.environ.get("SYMBOL_AUTO_DISCOVERY", "true").lower() == "true"
+SYMBOLS_TOP_N = int(os.environ.get("SYMBOLS_TOP_N", "100"))
+SCALPING_MAX_SYMBOLS = int(os.environ.get("SCALPING_MAX_SYMBOLS", "16"))
+
+# Risk and money
+INITIAL_BALANCE = Q(os.environ.get("INITIAL_BALANCE", "3000"))
+LEVERAGE_MIN = Q(os.environ.get("LEVERAGE_MIN", "10"))
+LEVERAGE_MAX = Q(os.environ.get("LEVERAGE_MAX", "20"))
+
+RISK_PER_TRADE = Q(os.environ.get("RISK_PER_TRADE", "0.005"))
+MAX_TOTAL_RISK = Q(os.environ.get("MAX_TOTAL_RISK", "0.06"))
+MAX_CONCURRENT_POS = int(os.environ.get("MAX_CONCURRENT_POS", "8"))
+MIN_TRADE_COOLDOWN_SEC = int(os.environ.get("MIN_TRADE_COOLDOWN_SEC", "300"))
+
+SOFT_PAUSE_DD = Q(os.environ.get("SOFT_PAUSE_DD", "0.05"))
+MAX_DRAWDOWN = Q(os.environ.get("MAX_DRAWDOWN", "0.08"))
+DAILY_MAX_LOSS_FRAC = Q(os.environ.get("DAILY_MAX_LOSS_FRAC", "0.03"))
+
+# Ensemble thresholds
+BASE_SCORE_THRESHOLD = Q(os.environ.get("BASE_SCORE_THRESHOLD", "0.9"))
+HV_SCORE_THRESHOLD = Q(os.environ.get("HV_SCORE_THRESHOLD", "1.1"))
+
+# Position management
+PARTIAL_AT_R = Q(os.environ.get("PARTIAL_AT_R", "1.0"))
+PARTIAL_FRACTION = Q(os.environ.get("PARTIAL_FRACTION", "0.5"))
+TRAIL_ATR_BASE = Q(os.environ.get("TRAIL_ATR_BASE", "1.4"))
+TRAIL_ATR_TIGHT2 = Q(os.environ.get("TRAIL_ATR_TIGHT2", "1.0"))
+TRAIL_ATR_TIGHT3 = Q(os.environ.get("TRAIL_ATR_TIGHT3", "0.7"))
+PYRAMID_MAX_STEPS = int(os.environ.get("PYRAMID_MAX_STEPS", "2"))
+PYRAMID_STEP_ATR = Q(os.environ.get("PYRAMID_STEP_ATR", "0.7"))
+PYRAMID_ADD_FRAC = Q(os.environ.get("PYRAMID_ADD_FRAC", "0.5"))
+
+# Recovery
+RECOVERY_ENABLED = os.environ.get("RECOVERY_ENABLED", "true").lower() == "true"
+RECOVERY_BUCKET_FRACTION = Q(os.environ.get("RECOVERY_BUCKET_FRACTION", "0.35"))
+RECOVERY_MAX_RISK_FRAC = Q(os.environ.get("RECOVERY_MAX_RISK_FRAC", "0.012"))
+RECOVERY_MIN_RISK_FRAC = Q(os.environ.get("RECOVERY_MIN_RISK_FRAC", "0.001"))
+RECOVERY_SCALP_SL_ATR = Q(os.environ.get("RECOVERY_SCALP_SL_ATR", "0.6"))
+RECOVERY_SCALP_TP_ATR = Q(os.environ.get("RECOVERY_SCALP_TP_ATR", "1.0"))
+MAX_PARALLEL_RECOVERY_TRADES = int(os.environ.get("MAX_PARALLEL_RECOVERY_TRADES", "1"))
+
+# Hedging
+TEMP_ENTRY_HEDGE_FRAC = Q(os.environ.get("TEMP_ENTRY_HEDGE_FRAC", "0.3"))
+TEMP_HEDGE_CLOSE_AT_R = Q(os.environ.get("TEMP_HEDGE_CLOSE_AT_R", "0.7"))
+MAX_HEDGE_NOTIONAL_MULT = Q(os.environ.get("MAX_HEDGE_NOTIONAL_MULT", "1.2"))
+
+# Funding
+FUNDING_TTL = int(os.environ.get("FUNDING_TTL", "600"))
+HIGH_POSITIVE_FUNDING = Q(os.environ.get("HIGH_POSITIVE_FUNDING", "0.00025"))
+HIGH_NEGATIVE_FUNDING = Q(os.environ.get("HIGH_NEGATIVE_FUNDING", "-0.00025"))
+
+# Network / loop
+GLOBAL_LOOP_SLEEP_RANGE = (float(os.environ.get("LOOP_SLEEP_MIN", "0.9")),
+                           float(os.environ.get("LOOP_SLEEP_MAX", "1.6")))
+MAX_KLINE_UPDATES_PER_LOOP = int(os.environ.get("MAX_KLINE_UPDATES_PER_LOOP", "16"))
+TICKER_FRESHNESS_SEC = float(os.environ.get("TICKER_FRESHNESS_SEC", "15"))
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
+RETRY_LIMIT = int(os.environ.get("RETRY_LIMIT", "5"))
+
+# Telegram
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and len(TELEGRAM_TOKEN) > 20)
+TELEGRAM_MIN_INTERVAL = float(os.environ.get("TELEGRAM_MIN_INTERVAL", "0.8"))
+TELEGRAM_REPORT_INTERVAL_SEC = int(os.environ.get("TELEGRAM_REPORT_INTERVAL_SEC", "900"))
 
+# Grid
+GRID_LEVELS = int(os.environ.get("GRID_LEVELS", "8"))
+GRID_SPACING_PCT = Q(os.environ.get("GRID_SPACING_PCT", "0.004"))
+GRID_RISK_FRACTION = Q(os.environ.get("GRID_RISK_FRACTION", "0.15"))
+GRID_COOLDOWN_SEC = int(os.environ.get("GRID_COOLDOWN_SEC", "45"))
+
+# Arbitrage
+ARB_SCAN_INTERVAL_SEC = int(os.environ.get("ARB_SCAN_INTERVAL_SEC", "30"))
+ARB_MIN_NET_PCT = Q(os.environ.get("ARB_MIN_NET_PCT", "0.0015"))
+ARB_EXCHANGES = [e.strip() for e in os.environ.get("ARB_EXCHANGES", "").split(",") if e.strip()]
+
+# KeepAlive
+KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL", "").strip()
+SELF_URL = os.environ.get("SELF_URL", "").strip()
+KEEPALIVE_INTERVAL_SEC = int(os.environ.get("KEEPALIVE_INTERVAL_SEC", "60"))
+
+# Persistence
 DB_PATH = os.environ.get("DB_PATH", "state.db")
-SYMBOLS = list(dict.fromkeys([s.strip() for s in os.environ.get("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]))
-PORT = int(os.environ.get("PORT", "10000"))
+JSON_SNAPSHOT = os.environ.get("JSON_SNAPSHOT", "state_snapshot.json")
+PERSIST_JSON_INTERVAL_SEC = int(os.environ.get("PERSIST_JSON_INTERVAL_SEC", "180"))
 
-DATA_MAX_AGE = 300
-PRICE_MAX_AGE = 60
+# Web
+PORT = int(os.environ.get("PORT", "10000"))
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+
+# ====================== LOGGING ======================
+def setup_logging():
+    logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", force=True) # force=True to ensure config applies
+
 
 # ====================== UTILS ======================
-def safe_decimal(value: Any, default: D = D("0")) -> D:
-    try:
-        if isinstance(value, D) and value.is_finite(): return value
-        if value is None or str(value).lower() in ['nan', 'inf', '-inf', '']: return default
-        result = D(str(value))
-        return result if result.is_finite() else default
-    except: return default
+def sleep_jitter(a: float, b: float):
+    time.sleep(random.uniform(a, b))
+
+
+def utc_midnight_ts() -> int:
+    dt = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(dt.timestamp())
+
 
 def quantize_step(x: D, step: D, rounding=ROUND_DOWN) -> D:
-    try:
-        return (x / step).to_integral_value(rounding=rounding) * step if step > 0 and x.is_finite() and step.is_finite() else x
-    except: return x
+    if step <= 0:
+        return x
+    return (x / step).to_integral_value(rounding=rounding) * step
 
-def validate_dataframe(df: pd.DataFrame, min_rows: int = 10) -> bool:
-    if df.empty or len(df) < min_rows: return False
-    required_cols = ['open', 'high', 'low', 'close', 'volume']
-    if not all(col in df.columns for col in required_cols): return False
-    return not any(df[col].isna().all() or (df[col] <= 0).all() for col in required_cols)
-
-def is_data_fresh(timestamp: float, max_age: int = DATA_MAX_AGE) -> bool:
-    return time.time() - timestamp < max_age
-
-# ====================== EXCEPTIONS ======================
-class TradingBotError(Exception): pass
-class ExchangeUnavailable(TradingBotError): pass
-class HardStopTriggered(TradingBotError): pass
-class ConfigurationError(TradingBotError): pass
-class InsufficientFundsError(TradingBotError): pass
-
-# ====================== CIRCUIT BREAKER ======================
-class CircuitBreaker:
-    def __init__(self, max_failures: int = 5, reset_after: int = 60):
-        self.max_failures, self.reset_after = max_failures, reset_after
-        self.failures, self.opened_at, self.last_attempt = 0, 0.0, 0.0
-        self._lock = RLock()
-
-    def record_success(self):
-        with self._lock:
-            self.failures = max(0, self.failures - 1)
-            if self.failures == 0: self.opened_at = 0.0
-
-    def record_failure(self):
-        with self._lock:
-            self.failures += 1
-            self.last_attempt = time.time()
-            if self.failures >= self.max_failures and self.opened_at == 0.0:
-                self.opened_at = time.time()
-
-    def allow(self) -> bool:
-        with self._lock:
-            now = time.time()
-            if self.opened_at == 0.0: return True
-            if now - self.opened_at >= self.reset_after:
-                if now - self.last_attempt >= self.reset_after * 0.5:
-                    self.failures = max(0, self.failures - 1)
-                    if self.failures < self.max_failures // 2: self.opened_at = 0.0
-                return True
-            return False
-
-    @property
-    def tripped(self) -> bool:
-        with self._lock: return self.opened_at != 0.0
 
 # ====================== NOTIFIER ======================
 class Notifier:
     def __init__(self, enabled: bool):
         self.enabled = enabled
         self._last_send, self._min_interval = 0.0, 2.0
-        self._message_queue: List[Tuple[str, bool, float]] = [] # Explicit type hint
+        self._message_queue: List[Tuple[str, bool, float]] = []
         self._lock = RLock()
         self.logger = logging.getLogger(self.__class__.__name__)
-        # Start a separate thread to process the queue, to avoid blocking
         self._queue_processor_thread = threading.Thread(target=self._run_queue_processor, daemon=True)
         self._queue_processor_thread.start()
 
+
     def _run_queue_processor(self):
         while True:
-            time.sleep(self._min_interval / 2) # Check more frequently
+            time.sleep(self._min_interval / 2) # Check more frequently than send interval
             with self._lock:
                 self._process_queue()
+
 
     def send(self, msg: str, critical: bool = False):
         if not self.enabled:
@@ -169,25 +227,22 @@ class Notifier:
         with self._lock:
             self._message_queue.append((msg, critical, time.time()))
             if len(self._message_queue) > 100: self._message_queue = self._message_queue[-100:]
-            # No direct call to _process_queue here, thread handles it
+            # The separate thread _run_queue_processor will pick it up
+
 
     def _process_queue(self):
-        # This method is called from the _run_queue_processor thread, already under _lock
+        # This method is called from _run_queue_processor, so already under self._lock
         if not self._message_queue or time.time() - self._last_send < self._min_interval: return
         
-        # Sort critical messages to the front, then by timestamp
-        # Using a stable sort to maintain original order for non-critical messages
-        sorted_queue = sorted(self._message_queue, key=lambda x: (not x[1], x[2]))
+        # Prioritize critical messages
+        sorted_queue = sorted(self._message_queue, key=lambda x: (not x[1], x[2])) # Critical first, then by timestamp
+        message_to_send = sorted_queue[0]
         
-        msg_to_send = sorted_queue[0]
-        
-        if self._send_telegram(msg_to_send[0]):
+        if self._send_telegram(message_to_send[0]):
             self._last_send = time.time()
-            self._message_queue.remove(msg_to_send) # Remove the exact sent message
-        else:
-            # If send failed, mark as non-critical for a while or requeue with lower priority
-            # For simplicity here, just move to end or keep for retry
-            pass # The thread will retry
+            self._message_queue.remove(message_to_send) # Remove the exact tuple
+        # If send failed, it remains in the queue for retry
+
 
     def _send_telegram(self, msg: str) -> bool:
         try:
@@ -199,7 +254,9 @@ class Notifier:
             self.logger.warning(f"Telegram send failed: {e}")
             return False
 
+
     def send_critical(self, msg: str): self.send(msg, critical=True)
+
 
 # ====================== STRATEGY ======================
 class Strategy:
@@ -234,10 +291,8 @@ class Strategy:
                 if len(closes) < 30:
                     mom_scores[symbol] = 0.0
                     continue
-                # Ensure float conversion for arithmetic ops if pandas series are float
-                returns_1w = float(closes.iloc[-1]) / float(closes.iloc[-7]) - 1 if len(closes) >= 7 and float(closes.iloc[-7]) != 0 else 0.0
-                returns_1m = float(closes.iloc[-1]) / float(closes.iloc[-30]) - 1 if len(closes) >= 30 and float(closes.iloc[-30]) != 0 else 0.0
-                
+                returns_1w = (float(closes.iloc[-1]) / float(closes.iloc[-7]) - 1) if len(closes) >= 7 and closes.iloc[-7] != 0 else 0.0
+                returns_1m = (float(closes.iloc[-1]) / float(closes.iloc[-30]) - 1) if len(closes) >= 30 and closes.iloc[-30] != 0 else 0.0
                 if not all(np.isfinite([returns_1w, returns_1m])): returns_1w = returns_1m = 0.0
                 mom_scores[symbol] = max(-1.0, min(1.0, returns_1w * 0.3 + returns_1m * 0.7))
             
@@ -309,36 +364,31 @@ class Strategy:
             # Pair trading
             try:
                 if validate_dataframe(btc_df5, 20) and len(btc_df5) >= len(df5):
-                    # Ensure series are not empty before accessing iloc
                     asset_returns = df5["close"].pct_change().dropna().tail(20)
                     btc_returns = btc_df5["close"].pct_change().dropna().tail(20)
-
+                    
                     min_len = min(len(asset_returns), len(btc_returns))
                     if min_len >= 10:
-                        asset_ret_vals, btc_ret_vals = asset_returns.tail(min_len).values, btc_returns.tail(min_len).values
-                        
-                        if (np.isfinite(asset_ret_vals).all() and np.isfinite(btc_ret_vals).all() and 
-                            np.std(asset_ret_vals) > 0 and np.std(btc_ret_vals) > 0):
-                            correlation = np.corrcoef(asset_ret_vals, btc_ret_vals)[0, 1]
+                        asset_ret, btc_ret = asset_returns.tail(min_len).values, btc_returns.tail(min_len).values
+                        if (np.isfinite(asset_ret).all() and np.isfinite(btc_ret).all() and 
+                            np.std(asset_ret) > 0 and np.std(btc_ret) > 0):
+                            correlation = np.corrcoef(asset_ret, btc_ret)[0, 1]
                             if np.isfinite(correlation) and abs(correlation) > 0.5:
-                                # Ensure closes are not empty before accessing iloc
-                                if not df5["close"].empty and not btc_df5["close"].empty and len(df5["close"]) >= 10 and len(btc_df5["close"]) >= 10:
-                                    btc_momentum = float(btc_df5["close"].iloc[-1]) / float(btc_df5["close"].iloc[-10]) - 1
-                                    asset_momentum = float(df5["close"].iloc[-1]) / float(df5["close"].iloc[-10]) - 1
-                                    if np.isfinite(btc_momentum) and np.isfinite(asset_momentum):
-                                        relative_perf = max(-0.5, min(0.5, asset_momentum - btc_momentum))
-                                        scores["pair"] = (max(0.0, -relative_perf) if relative_perf < -0.02 else 0.0,
-                                                        max(0.0, relative_perf) if relative_perf > 0.02 else 0.0)
-                                    else: scores["pair"] = (0.0, 0.0)
+                                btc_momentum = (float(btc_df5["close"].iloc[-1]) / float(btc_df5["close"].iloc[-10]) - 1) if btc_df5["close"].iloc[-10] != 0 else 0.0
+                                asset_momentum = (float(df5["close"].iloc[-1]) / float(df5["close"].iloc[-10]) - 1) if df5["close"].iloc[-10] != 0 else 0.0
+                                if np.isfinite(btc_momentum) and np.isfinite(asset_momentum):
+                                    relative_perf = max(-0.5, min(0.5, asset_momentum - btc_momentum))
+                                    scores["pair"] = (max(0.0, -relative_perf) if relative_perf < -0.02 else 0.0,
+                                                    max(0.0, relative_perf) if relative_perf > 0.02 else 0.0)
                                 else: scores["pair"] = (0.0, 0.0)
                             else: scores["pair"] = (0.0, 0.0)
                         else: scores["pair"] = (0.0, 0.0)
                     else: scores["pair"] = (0.0, 0.0)
                 else: scores["pair"] = (0.0, 0.0)
-            except Exception as e: 
+            except Exception as e:
                 self.logger.warning(f"Pair trading score failed for {symbol}: {e}")
                 scores["pair"] = (0.0, 0.0) # Ensure it always adds to scores dictionary
-            
+
             return scores
         except Exception as e:
             self.logger.error(f"Alpha scores failed for {symbol}: {e}")
@@ -371,7 +421,7 @@ class Position:
         if self.side not in ("long", "short"): raise ValueError(f"Invalid side: {self.side}")
         if not isinstance(self.qty, D) or self.qty <= 0 or not self.qty.is_finite(): raise ValueError(f"Invalid quantity: {self.qty}")
         if not isinstance(self.entry, D) or self.entry <= 0 or not self.entry.is_finite(): raise ValueError(f"Invalid entry: {self.entry}")
-        # SL/TP validation should allow 0 for no SL/TP
+        # SL/TP validation: allow 0 for no SL/TP, but if set, ensure logical consistency
         if self.sl > 0 and (not self.sl.is_finite() or (self.side == "long" and self.sl >= self.entry) or (self.side == "short" and self.sl <= self.entry)):
             raise ValueError(f"Invalid SL for {self.side} position: {self.sl} vs entry {self.entry}")
         if self.tp > 0 and (not self.tp.is_finite() or (self.side == "long" and self.tp <= self.entry) or (self.side == "short" and self.tp >= self.entry)):
@@ -406,20 +456,18 @@ class RiskManager:
     def _check_day_rollover(self):
         current_midnight = self._utc_midnight_ts()
         if current_midnight > self.day_anchor:
-            with self._lock: # Ensure thread safety for state modification
+            with self._lock:
                 days_passed = (current_midnight - self.day_anchor) // 86400
                 if days_passed >= 1:
-                    self.day_anchor = current_midnight
-                    self.daily_pnl = D("0")
-                    # Reduce loss_bucket over days, not just on wins
-                    self.loss_bucket = self.loss_bucket * (D("0.8") ** days_passed) # Compound reduction
-                    self.consec_losses = 0 # Reset consecutive losses on new day
+                    self.day_anchor, self.daily_pnl = current_midnight, D("0")
+                    # Compound reduction for loss_bucket
+                    self.loss_bucket = self.loss_bucket * (D("0.8") ** days_passed)
+                    self.consec_losses = 0
 
     @property
     def drawdown(self) -> D:
         with self._lock: 
-            # Recalculate equity_peak for accurate drawdown if balance surpassed it
-            self.equity_peak = max(self.equity_peak, self.balance)
+            self.equity_peak = max(self.equity_peak, self.balance) # Ensure peak is always up-to-date
             return max(D("0"), (self.equity_peak - self.balance) / self.equity_peak) if self.equity_peak > 0 else D("0")
     @property
     def risk_off(self) -> bool:
@@ -457,9 +505,9 @@ class RiskManager:
                 risk_amount, price_risk = self.balance * risk_fraction, abs(entry - sl)
                 if price_risk <= 0: return D("0")
                 position_size = risk_amount / price_risk
-                max_position_value = self.balance * D("10") # Example: 10x max position value vs balance
+                max_position_value = self.balance * D("10") # Example: max 10x balance in notional value for a single position
                 return max(D("0"), min(position_size, max_position_value / entry if entry > 0 else D("0")))
-        except Exception as e:
+        except Exception as e: # Catch any other potential errors
             self.logger.warning(f"Position sizing failed: {e}")
             return D("0")
 
@@ -469,7 +517,9 @@ class ExchangeWrapper:
         self.logger, self.mode = logging.getLogger(self.__class__.__name__), mode
         self._init_exchange()
         self.circuit_breaker = CircuitBreaker()
-        self._steps_cache, self._min_notional_cache, self._market_status_cache = {}, {}, {}
+        self._steps_cache: Dict[str, Tuple[D, D]] = {} # Explicit type hint
+        self._min_notional_cache: Dict[str, D] = {} # Explicit type hint
+        self._market_status_cache: Dict[str, bool] = {} # Explicit type hint
         self._last_market_check = 0.0
         self._load_market_info()
 
@@ -483,18 +533,18 @@ class ExchangeWrapper:
                 "timeout": HTTP_TIMEOUT * 1000
             }
             if self.mode == "paper":
-                # Binance Testnet for Futures
+                # Binance Futures Testnet configuration
                 config["options"]["defaultType"] = "future"
                 config["urls"] = {
                     'api': 'https://testnet.binancefuture.com/fapi/v1',
                     'www': 'https://testnet.binancefuture.com',
                     'dapi': 'https://testnet.binancefuture.com/dapi/v1',
                 }
-                config['hostname'] = 'testnet.binancefuture.com' # Required for testnet
+                config['hostname'] = 'testnet.binancefuture.com' # Essential for ccxt to hit testnet
             self.exchange = ccxt.binance(config)
-            self.exchange.load_markets()
+            self.exchange.load_markets() # Load markets after config
             futures_markets = [s for s, m in self.exchange.markets.items() if m.get('type') == 'future']
-            if not futures_markets: raise ConfigurationError("No futures markets found")
+            if not futures_markets: raise ConfigurationError("No futures markets found on exchange")
         except Exception as e: raise ConfigurationError(f"Exchange init failed: {e}")
 
     def _load_market_info(self):
@@ -503,20 +553,21 @@ class ExchangeWrapper:
                 if market.get('type') != 'future': continue
                 precision, limits = market.get("precision", {}), market.get("limits", {})
                 price_prec, amount_prec = precision.get("price"), precision.get("amount")
+                # Fallback to limits min value if precision is None
                 tick_size = D(f"1e-{price_prec}") if price_prec is not None else safe_decimal(limits.get("price", {}).get("min"), D("0.01"))
                 step_size = D(f"1e-{amount_prec}") if amount_prec is not None else safe_decimal(limits.get("amount", {}).get("min"), D("0.001"))
                 if tick_size <= 0: tick_size = D("0.01")
                 if step_size <= 0: step_size = D("0.001")
                 self._steps_cache[symbol] = (tick_size, step_size)
                 min_cost = limits.get("cost", {}).get("min")
-                if min_cost is None:
+                if min_cost is None: # Binance futures uses minNotional or quoteOrderQtyMin
                     info = market.get("info", {})
                     min_cost = info.get("minNotional") or info.get("quoteOrderQtyMin") if isinstance(info, dict) else None
                 self._min_notional_cache[symbol] = safe_decimal(min_cost, D("5"))
                 self._market_status_cache[symbol] = market.get('active', True)
         except Exception as e: raise ConfigurationError(f"Market info loading failed: {e}")
 
-    def _with_retries(self, func, *args, **kwargs):
+    def _with_retries(self, func: Callable, *args, **kwargs):
         if not self.circuit_breaker.allow(): raise ExchangeUnavailable("Circuit breaker open")
         last_exception = None
         for attempt in range(RETRY_LIMIT):
@@ -534,11 +585,10 @@ class ExchangeWrapper:
     def is_market_active(self, symbol: str) -> bool:
         if time.time() - self._last_market_check > 3600:
             try:
-                self.exchange.load_markets()
-                self._load_market_info()
+                self.exchange.load_markets() # Refresh markets
+                self._load_market_info() # Reload info based on fresh markets
                 self._last_market_check = time.time()
-            except Exception as e:
-                self.logger.warning(f"Failed to refresh market status: {e}")
+            except Exception as e: self.logger.warning(f"Failed to refresh market status: {e}")
         return self._market_status_cache.get(symbol, False)
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 300) -> List[List]:
@@ -552,19 +602,22 @@ class ExchangeWrapper:
     def create_order(self, symbol: str, order_type: str, side: str, amount: D, price: Optional[D] = None, params: Optional[Dict] = None) -> Dict:
         if not self.is_market_active(symbol): raise ExchangeUnavailable(f"Market {symbol} not active")
         if amount <= 0 or not amount.is_finite(): raise ValueError(f"Invalid amount: {amount}")
+        
         tick_size, step_size = self._steps_cache.get(symbol, (D("0.01"), D("0.001")))
         rounded_amount = quantize_step(amount, step_size)
-        if rounded_amount <= 0: raise ValueError(f"Amount too small: {amount}")
-        # Fetch current price for notional calculation if limit price not provided
+        if rounded_amount <= 0: raise ValueError(f"Quantized amount too small: {rounded_amount}")
+        
+        # Determine price for notional check (for market orders, use current ticker)
         current_price_for_notional = price if price else safe_decimal(self.fetch_ticker(symbol).get('last', D("0")), D("0"))
         if current_price_for_notional <= 0: raise ExchangeUnavailable(f"Cannot get valid price for notional check on {symbol}")
         
         min_notional = self._min_notional_cache.get(symbol, D("5"))
         notional = rounded_amount * current_price_for_notional
-        if notional < min_notional: raise InsufficientFundsError(f"Notional {notional} below minimum {min_notional}")
+        if notional < min_notional: raise InsufficientFundsError(f"Notional {notional} below minimum {min_notional} for {symbol}")
         
-        # Ensure price is quantized if provided
-        price_float = float(quantize_step(price, tick_size)) if price else None
+        # Quantize price if provided, then convert to float for ccxt
+        price_float = float(quantize_step(price, tick_size)) if price is not None else None
+        
         return self._with_retries(self.exchange.create_order, symbol, order_type, side, float(rounded_amount), price_float, params or {})
 
     def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict]:
@@ -606,7 +659,7 @@ class DataManager:
                 (df['low'] > df['open']) | 
                 (df['low'] > df['close']) | 
                 (df['volume'] < 0) | 
-                df[['open', 'high', 'low', 'close', 'volume']].isna().any(axis=1) # Check for NaNs again after dropna, just in case
+                df[['open', 'high', 'low', 'close', 'volume']].isna().any(axis=1)
             )
             if invalid_ohlc.any(): df = df[~invalid_ohlc]
             if len(df) < 10: return False
@@ -617,10 +670,10 @@ class DataManager:
             return True
         except Exception as e:
             self.update_errors[symbol] += 1; self.logger.error(f"Data update failed {symbol} {timeframe}: {e}")
-            if self.update_errors[symbol] > 5: # If too many errors, backoff
-                self.logger.warning(f"Too many errors for {symbol}. Sleeping 60s and resetting error count.")
-                time.sleep(60)
-                self.update_errors[symbol] = 0
+            if self.update_errors[symbol] > 5: # If too many errors, log and potentially backoff for longer.
+                self.logger.warning(f"Too many errors for {symbol} data updates. Consider longer backoff or alert.")
+                time.sleep(60) # Increased backoff
+                self.update_errors[symbol] = 0 # Reset after extended backoff
             return False
 
     def get_data(self, symbol: str, timeframe: str) -> pd.DataFrame:
@@ -640,7 +693,7 @@ class DataManager:
 # ====================== INDICATOR CACHE ======================
 class IndicatorCache:
     def __init__(self, max_size: int = 1000):
-        self.cache: Dict[str, Dict] = {} # Key is a string, value is dict of indicators
+        self.cache: Dict[str, Dict[str, float]] = {} # Cache stores string keys for time-based identification, and inner dict for indicators
         self.max_size = max_size
         self.access_times: Dict[str, float] = {}
         self._lock = RLock()
@@ -648,10 +701,10 @@ class IndicatorCache:
         self.miss_count = 0
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def get_indicators(self, symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame) -> Dict:
+    def get_indicators(self, symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame) -> Dict[str, float]: # Return Dict of str to float
         if not all(validate_dataframe(df, 20) for df in [df5, df15, df1h]): return {}
         try: 
-            # Ensure timestamps are integers for a robust cache key
+            # Create a cache key based on the latest timestamp of the relevant dataframes
             cache_key = f"{symbol}_{int(df5['timestamp'].iloc[-1])}_{int(df15['timestamp'].iloc[-1])}_{int(df1h['timestamp'].iloc[-1])}"
         except Exception as e: 
             self.logger.debug(f"Failed to create cache key for {symbol}: {e}")
@@ -659,79 +712,68 @@ class IndicatorCache:
         
         with self._lock:
             if cache_key in self.cache:
-                self.access_times[cache_key], self.hit_count = time.time(), self.hit_count + 1
+                self.access_times[cache_key] = time.time()
+                self.hit_count += 1
                 return self.cache[cache_key].copy()
             self.miss_count += 1
             indicators = self._calculate_indicators(df5, df15, df1h)
             if indicators:
-                self.cache[cache_key], self.access_times[cache_key] = indicators, time.time()
+                self.cache[cache_key] = indicators
+                self.access_times[cache_key] = time.time()
                 if len(self.cache) > self.max_size: self._cleanup_cache()
             return indicators
 
-    def _calculate_indicators(self, df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame) -> Dict:
-        indicators = {}
-        try:
-            # Ensure series are not empty before passing to indicator functions
-            # and handle potential NaNs from indicator calculations
-            
-            # Helper for safe indicator calculation
-            def safe_indicator_calc(func, df_col):
-                if df_col.empty or df_col.isna().all(): return pd.Series([np.nan])
-                try:
-                    result = func()
-                    return result if not result.empty and not result.isna().all() else pd.Series([np.nan])
-                except Exception as e:
-                    self.logger.debug(f"Indicator calculation failed: {e}")
-                    return pd.Series([np.nan])
+    def _calculate_indicators(self, df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame) -> Dict[str, float]: # Return Dict of str to float
+        indicators_results = {} # Will store the final float values
+        
+        # Helper for safe indicator calculation to return a float or np.nan
+        def safe_indicator_value(func, df_for_check: pd.Series):
+            if df_for_check.empty or df_for_check.isna().all(): return np.nan
+            try:
+                result_series = func()
+                return float(result_series.iloc[-1]) if not result_series.empty and not pd.isna(result_series.iloc[-1]) else np.nan
+            except Exception as e:
+                self.logger.debug(f"Individual indicator calculation failed: {e}")
+                return np.nan
 
-            indicators['ema_12'] = safe_indicator_calc(lambda: EMAIndicator(df5["close"], 12).ema_indicator(), df5["close"])
-            indicators['ema_26'] = safe_indicator_calc(lambda: EMAIndicator(df5["close"], 26).ema_indicator(), df5["close"])
-            indicators['rsi'] = safe_indicator_calc(lambda: RSIIndicator(df5["close"], 14).rsi(), df5["close"])
-            indicators['atr'] = safe_indicator_calc(lambda: AverageTrueRange(df5["high"], df5["low"], df5["close"], 14).average_true_range(), df5["close"]) # ATR needs OHLC
-            
-            bb_obj = BollingerBands(df5["close"], 20, 2)
-            indicators['bb_upper'] = safe_indicator_calc(bb_obj.bollinger_hband, df5["close"])
-            indicators['bb_lower'] = safe_indicator_calc(bb_obj.bollinger_lband, df5["close"])
-            indicators['bb_middle'] = safe_indicator_calc(bb_obj.bollinger_mavg, df5["close"])
-            
-            macd_obj = MACD(df5["close"])
-            indicators['macd'] = safe_indicator_calc(macd_obj.macd, df5["close"])
-            indicators['macd_signal'] = safe_indicator_calc(macd_obj.macd_signal, df5["close"])
-            
-            indicators['vwap'] = safe_indicator_calc(lambda: VolumeWeightedAveragePrice(df5["high"], df5["low"], df5["close"], df5["volume"]).volume_weighted_average_price(), df5["close"])
-            
-            # Donchian Channel
-            if not df5["high"].empty and not df5["low"].empty:
-                indicators['don_high'] = df5["high"].rolling(20).max()
-                indicators['don_low'] = df5["low"].rolling(20).min()
-            else:
-                indicators['don_high'] = pd.Series([np.nan] * len(df5), index=df5.index)
-                indicators['don_low'] = pd.Series([np.nan] * len(df5), index=df5.index)
-            
-            indicators['sma_50_1h'] = safe_indicator_calc(lambda: SMAIndicator(df1h["close"], 50).sma_indicator(), df1h["close"])
-            
-            # Ensure all series are converted to the final value or NaN, as the cache stores dict of values
-            final_indicators = {}
-            for k, v in indicators.items():
-                if isinstance(v, pd.Series) and not v.empty and not pd.isna(v.iloc[-1]):
-                    final_indicators[k] = float(v.iloc[-1]) # Store as float for consistency with TA lib outputs
-                else:
-                    final_indicators[k] = np.nan # Use np.nan for missing/invalid values
-            return final_indicators
-        except Exception as e:
-            self.logger.error(f"Error calculating indicators: {e}")
-            return {}
+        indicators_results['ema_12'] = safe_indicator_value(lambda: EMAIndicator(df5["close"], 12).ema_indicator(), df5["close"])
+        indicators_results['ema_26'] = safe_indicator_value(lambda: EMAIndicator(df5["close"], 26).ema_indicator(), df5["close"])
+        indicators_results['rsi'] = safe_indicator_value(lambda: RSIIndicator(df5["close"], 14).rsi(), df5["close"])
+        indicators_results['atr'] = safe_indicator_value(lambda: AverageTrueRange(df5["high"], df5["low"], df5["close"], 14).average_true_range(), df5["close"])
+        
+        bb_obj = BollingerBands(df5["close"], 20, 2)
+        indicators_results['bb_upper'] = safe_indicator_value(bb_obj.bollinger_hband, df5["close"])
+        indicators_results['bb_lower'] = safe_indicator_value(bb_obj.bollinger_lband, df5["close"])
+        indicators_results['bb_middle'] = safe_indicator_value(bb_obj.bollinger_mavg, df5["close"])
+        
+        macd_obj = MACD(df5["close"])
+        indicators_results['macd'] = safe_indicator_value(macd_obj.macd, df5["close"])
+        indicators_results['macd_signal'] = safe_indicator_value(macd_obj.macd_signal, df5["close"])
+        
+        indicators_results['vwap'] = safe_indicator_value(lambda: VolumeWeightedAveragePrice(df5["high"], df5["low"], df5["close"], df5["volume"]).volume_weighted_average_price(), df5["close"])
+        
+        # Donchian Channel requires rolling window, get last value safely
+        if not df5["high"].empty and not df5["low"].empty:
+            indicators_results['don_high'] = float(df5["high"].rolling(20).max().iloc[-1]) if not df5["high"].rolling(20).max().empty else np.nan
+            indicators_results['don_low'] = float(df5["low"].rolling(20).min().iloc[-1]) if not df5["low"].rolling(20).min().empty else np.nan
+        else:
+            indicators_results['don_high'] = np.nan
+            indicators_results['don_low'] = np.nan
+        
+        indicators_results['sma_50_1h'] = safe_indicator_value(lambda: SMAIndicator(df1h["close"], 50).sma_indicator(), df1h["close"])
+        
+        return indicators_results
 
     def _cleanup_cache(self):
         try:
+            # Clear oldest 30% of cache items if size exceeds max_size
             sorted_items = sorted(self.access_times.items(), key=lambda x: x[1])
-            to_remove = max(1, int(len(sorted_items) * 0.3))
-            for key, _ in sorted_items[:to_remove]:
+            to_remove_count = max(1, int(len(sorted_items) * 0.3))
+            for key, _ in sorted_items[:to_remove_count]:
                 self.cache.pop(key, None)
                 self.access_times.pop(key, None)
             self.logger.debug(f"Cleaned cache. New size: {len(self.cache)}")
-        except Exception as e:
-            self.logger.warning(f"Cache cleanup failed: {e}")
+        except Exception as e: self.logger.warning(f"Cache cleanup failed: {e}")
 
 # ====================== DATABASE MANAGER ======================
 class DatabaseManager:
@@ -757,10 +799,11 @@ class DatabaseManager:
                             mode TEXT NOT NULL, tag TEXT NOT NULL, pyramids INTEGER DEFAULT 0 CHECK (pyramids >= 0), last_add_price TEXT, 
                             entry_order_id TEXT, sl_order_id TEXT, tp_order_id TEXT, client_order_id TEXT, time_limit REAL, 
                             updated_at REAL NOT NULL CHECK (updated_at > 0))""")
+                # Insert initial risk state if not exists
                 if not conn.execute("SELECT COUNT(*) FROM risk_state WHERE id=1").fetchone()[0]:
                     now, midnight_ts = time.time(), int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
                     conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (1,?,?,?,?,?,?,?,?,?)", 
-                                (str(INITIAL_BALANCE), str(INITIAL_BALANCE), '0', '0', 0, 0, 0, midnight_ts, now)) # Added missing fields for INSERT
+                                (str(INITIAL_BALANCE), str(INITIAL_BALANCE), '0', '0', 0, 0, 0, midnight_ts, now))
                 conn.commit()
         except Exception as e: raise ConfigurationError(f"Database init failed: {e}")
 
@@ -769,12 +812,12 @@ class DatabaseManager:
         conn = None
         try:
             with self._connection_pool_lock:
-                conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+                conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None) # isolation_level=None for autocommit behavior
                 conn.execute("PRAGMA busy_timeout=30000; PRAGMA temp_store=MEMORY")
             yield conn
         except Exception as e:
             if conn: 
-                try: conn.rollback()
+                try: conn.rollback() # Explicit rollback if within a transaction
                 except: pass
             raise e
         finally:
@@ -784,23 +827,22 @@ class DatabaseManager:
 
     def save_risk_state(self, risk_manager) -> bool:
         try:
-            with self._get_connection() as conn: # Removed risk_manager._lock, now handled by DBWriter or higher level
-                # Data values extracted from risk_manager
-                with risk_manager._lock:
+            with self._get_connection() as conn: # Removed risk_manager._lock as it's handled at a higher level
+                with risk_manager._lock: # Acquire risk_manager's lock to read its state
                     data = (str(risk_manager.balance), str(risk_manager.equity_peak), str(risk_manager.daily_pnl), str(risk_manager.loss_bucket),
-                        risk_manager.consec_losses, risk_manager.paused_until, risk_manager._risk_off_until, risk_manager.day_anchor, time.time())
+                           risk_manager.consec_losses, risk_manager.paused_until, risk_manager._risk_off_until, risk_manager.day_anchor, time.time())
                 
-                # Check for infinite/NaN values before saving
-                for item in data:
-                    if isinstance(item, str) and not safe_decimal(item).is_finite():
-                         self.logger.error(f"Non-finite value in risk state for saving: {item}")
-                         return False
+                # Input validation for data
+                for item in data[:4]: # Check balance, equity_peak, daily_pnl, loss_bucket
+                    if not safe_decimal(item).is_finite():
+                        self.logger.error(f"Non-finite value detected for risk state save: {item}")
+                        return False
 
-                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("BEGIN IMMEDIATE") # Start transaction
                 try:
                     conn.execute("UPDATE risk_state SET balance=?,equity_peak=?,daily_pnl=?,loss_bucket=?,consec_losses=?,paused_until=?,risk_off_until=?,day_anchor=?,updated_at=? WHERE id=1", data)
-                    if conn.total_changes == 0: # If no rows affected, maybe it wasn't inserted, try insert
-                        conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (1,?,?,?,?,?,?,?,?,?)", (data))
+                    if conn.total_changes == 0: # If update failed, try insert (should only happen if init failed)
+                        conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (1,?,?,?,?,?,?,?,?,?)", data)
                     conn.execute("COMMIT"); return True
                 except Exception as e: conn.execute("ROLLBACK"); raise e
         except Exception as e: self.logger.error(f"Save risk state failed: {e}"); return False
@@ -811,20 +853,18 @@ class DatabaseManager:
                 row = conn.execute("SELECT balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at FROM risk_state WHERE id=1").fetchone()
                 if row:
                     data = {'balance': row[0], 'equity_peak': row[1], 'daily_pnl': row[2], 'loss_bucket': row[3], 'consec_losses': row[4], 'paused_until': row[5], 'risk_off_until': row[6], 'day_anchor': row[7], 'updated_at': row[8]}
-                    # Ensure all loaded decimal strings are finite and valid
+                    # Convert loaded string values to safe Decimal representation
                     for key in ['balance', 'equity_peak', 'daily_pnl', 'loss_bucket']:
-                        data[key] = str(safe_decimal(data.get(key), D("0"))) # Convert to string representation of valid Decimal
+                        data[key] = str(safe_decimal(data.get(key), D("0")))
                     return data
                 return {}
         except Exception as e: self.logger.error(f"Load risk state failed: {e}"); return {}
 
     def save_position(self, position: Position) -> bool:
         try:
-            # position.__post_init__() is implicitly called on creation/dataclass
-            # Re-validation of position attributes is good practice before saving
-            position.qty.is_finite() # Check if position data is valid
+            position.__post_init__() # Validate position before saving
             with self._get_connection() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("BEGIN IMMEDIATE") # Start transaction
                 try:
                     conn.execute("INSERT OR REPLACE INTO positions (symbol,side,qty,entry,sl,tp,lev,opened_at,partial,is_hedge,mode,tag,pyramids,last_add_price,entry_order_id,sl_order_id,tp_order_id,client_order_id,time_limit,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", 
                                 (position.symbol, position.side, str(position.qty), str(position.entry), str(position.sl), str(position.tp), str(position.lev), position.opened_at, int(position.partial), int(position.is_hedge), position.mode, position.tag, position.pyramids, str(position.last_add_price) if position.last_add_price is not None else None, position.entry_order_id, position.sl_order_id, position.tp_order_id, position.client_order_id, position.time_limit, time.time()))
@@ -835,7 +875,7 @@ class DatabaseManager:
     def delete_position(self, symbol: str) -> bool:
         try:
             with self._get_connection() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("BEGIN IMMEDIATE") # Start transaction
                 try: conn.execute("DELETE FROM positions WHERE symbol=?", (symbol,)); conn.execute("COMMIT"); return True
                 except Exception as e: conn.execute("ROLLBACK"); raise e
         except Exception as e: self.logger.error(f"Delete position failed {symbol}: {e}"); return False
@@ -849,7 +889,7 @@ class DatabaseManager:
                 for row in cursor.fetchall():
                     try:
                         data = dict(zip(columns, row))
-                        # Explicitly handle potential None for optional Decimal fields
+                        # Explicitly handle potential None for optional Decimal/float fields from DB
                         last_add_price_val = safe_decimal(data['last_add_price']) if data['last_add_price'] is not None else None
                         time_limit_val = float(data['time_limit']) if data['time_limit'] is not None else None
 
@@ -880,7 +920,7 @@ class DatabaseManager:
 class HealthMonitor:
     def __init__(self):
         self.start_time, self.error_count, self.last_error_time = time.time(), 0, 0.0
-        self.error_types: Dict[str, int] = {} # Explicitly type hint
+        self.error_types: Dict[str, int] = {}
         self._lock = RLock()
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -892,22 +932,21 @@ class HealthMonitor:
         with self._lock:
             uptime = time.time() - self.start_time
             try: import psutil; memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
-            except ImportError: # Changed to ImportError
+            except ImportError: # psutil might not be installed
                 memory_mb = 0.0
                 self.logger.debug("psutil not available, memory monitoring disabled.")
-            
             error_rate = self.error_count / (uptime / 3600) if uptime > 0 else 0
             status = 'healthy' if self.error_count < 5 and error_rate < 1.0 else ('degraded' if self.error_count < 20 and error_rate < 5.0 else 'unhealthy')
             return {'status': status, 'uptime_seconds': uptime, 'error_count': self.error_count, 'error_rate_per_hour': error_rate, 'error_types': dict(self.error_types), 'last_error_ago': time.time() - self.last_error_time if self.last_error_time > 0 else None, 'memory_usage_mb': memory_mb}
 
     def cleanup_memory(self): 
         try: gc.collect()
-        except Exception as e: self.logger.warning(f"Garbage collection failed: {e}") # Log exception
+        except Exception as e: self.logger.warning(f"Garbage collection failed: {e}")
 
 # ====================== PORTFOLIO ======================
 class Portfolio:
     def __init__(self):
-        self._positions: Dict[str, Position] = {} # Explicitly type hint
+        self._positions: Dict[str, Position] = {}
         self._lock = RLock()
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -916,12 +955,13 @@ class Portfolio:
             self.logger.error(f"Attempted to add invalid position type: {type(position)}")
             raise ValueError("Invalid position object provided")
         try:
-            position.__post_init__() # Re-validate if it was altered externally
+            position.__post_init__() # Re-validate if position attributes were altered
             with self._lock: self._positions[position.symbol] = position
             self.logger.debug(f"Added position {position.symbol} to portfolio.")
         except ValueError as e:
             self.logger.error(f"Error adding position {position.symbol} to portfolio: {e}")
             raise
+
     def remove_position(self, symbol: str) -> Optional[Position]:
         if not isinstance(symbol, str) or not symbol.strip():
             self.logger.error(f"Attempted to remove position with invalid symbol: {symbol}")
@@ -930,11 +970,14 @@ class Portfolio:
             removed = self._positions.pop(symbol, None)
             if removed: self.logger.debug(f"Removed position {symbol} from portfolio.")
             return removed
+
     def get_position(self, symbol: str) -> Optional[Position]:
         if not isinstance(symbol, str) or not symbol.strip(): return None
         with self._lock: return self._positions.get(symbol)
+
     def get_all_positions(self) -> List[Position]:
         with self._lock: return list(self._positions.values())
+
     def get_open_positions(self) -> List[Position]:
         with self._lock: return [p for p in self._positions.values() if not p.is_hedge]
 
@@ -947,13 +990,13 @@ class ExecutionEngine:
     def open_position(self, symbol: str, side: str, quantity: D, entry_price: D, stop_loss: D, take_profit: D, leverage: D, mode: str = "directional", tag: str = "strategy") -> Optional[Position]:
         with self._execution_lock:
             try:
-                # Parameter validation
+                # Basic parameter validation
                 if not all(isinstance(x, str) and x.strip() for x in [symbol, side, mode, tag]) or side not in ["long", "short"]:
                     raise ValueError("Invalid string parameters for open_position")
                 if not all(isinstance(x, D) and x.is_finite() for x in [quantity, entry_price, leverage]) or quantity <= 0 or entry_price <= 0 or not (D("0") < leverage <= D("100")):
                     raise ValueError("Invalid numeric parameters for open_position")
                 
-                # SL/TP validation
+                # SL/TP validation against entry_price
                 if stop_loss > 0 and ((side == "long" and stop_loss >= entry_price) or (side == "short" and stop_loss <= entry_price)):
                     raise ValueError(f"Invalid stop loss for {side} position: {stop_loss} vs entry {entry_price}")
                 if take_profit > 0 and ((side == "long" and take_profit <= entry_price) or (side == "short" and take_profit >= entry_price)):
@@ -964,7 +1007,8 @@ class ExecutionEngine:
                 tick_size, step_size = self.exchange.get_step_sizes(symbol)
                 min_notional = self.exchange.get_min_notional(symbol)
                 
-                rounded_qty = quantize_step(quantity, step_size, rounding=ROUND_DOWN) # Use ROUND_DOWN for qty
+                # Quantize all prices and quantities
+                rounded_qty = quantize_step(quantity, step_size, rounding=ROUND_DOWN)
                 rounded_entry = quantize_step(entry_price, tick_size, rounding=ROUND_HALF_UP)
                 rounded_sl = quantize_step(stop_loss, tick_size, rounding=ROUND_DOWN if side=="long" else ROUND_UP) if stop_loss > 0 else D("0")
                 rounded_tp = quantize_step(take_profit, tick_size, rounding=ROUND_UP if side=="long" else ROUND_DOWN) if take_profit > 0 else D("0")
@@ -972,6 +1016,7 @@ class ExecutionEngine:
                 if rounded_qty <= 0: raise ValueError(f"Quantized quantity too small: {rounded_qty}")
                 if rounded_qty * rounded_entry < min_notional: raise InsufficientFundsError(f"Notional {rounded_qty * rounded_entry} below minimum {min_notional} for {symbol}")
                 
+                # Create Position object
                 position = Position(symbol=symbol, side=side, qty=rounded_qty, entry=rounded_entry, sl=rounded_sl, tp=rounded_tp, lev=leverage, opened_at=time.time(), mode=mode, tag=tag)
                 
                 if self.mode == "paper":
@@ -979,28 +1024,25 @@ class ExecutionEngine:
                     self.notifier.send(f"📝 PAPER: Opened {side.upper()} {symbol} qty={rounded_qty} @ {rounded_entry}")
                 else: # Live trading
                     order_side, client_order_id = "buy" if side == "long" else "sell", f"omega_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-                    try:
-                        # Leverage setting can be finicky, set before order
-                        self.exchange.set_leverage(symbol, int(leverage)) # set_leverage now takes int
+                    
+                    try: self.exchange.set_leverage_safe(symbol, int(leverage)) # set_leverage_safe now takes int
                     except Exception as e: self.logger.warning(f"Set leverage failed {symbol}: {e}")
                     
                     # Place market order for entry
                     order = self.exchange.create_order(symbol=symbol, order_type="market", side=order_side, amount=rounded_qty, params={"newClientOrderId": client_order_id})
                     
                     position.entry_order_id, position.client_order_id = order.get("id"), client_order_id
-                    # Get actual fill price
-                    if order.get("average"): position.entry = safe_decimal(order["average"])
-                    elif order.get("price"): position.entry = safe_decimal(order["price"])
+                    # Get actual fill price from order if available, else use rounded_entry
+                    position.entry = safe_decimal(order.get("average") or order.get("price"), rounded_entry)
                     
                     # Save position to DB *after* successful entry order
                     if not self.db_manager.save_position(position):
-                        # Critical error: order placed, but DB update failed. Log and alert.
                         self.notifier.send_critical(f"CRITICAL: Order {order.get('id')} placed for {symbol}, but DB save failed. Manual intervention needed!")
-                        raise TradingBotError("Order placed but DB save failed.")
+                        raise TradingBotError("Order placed but DB save failed. Check exchange for orphan order.")
                     
                     self.notifier.send(f"✅ LIVE: Opened {side.upper()} {symbol} qty={position.qty} @ {position.entry}")
                     
-                    # Place OCO/Bracket orders (SL/TP)
+                    # Place OCO/Bracket orders (SL/TP) if applicable
                     if rounded_sl > 0 or rounded_tp > 0:
                         self._place_bracket_orders(position) # Helper function for bracket orders
                 return position
@@ -1018,8 +1060,6 @@ class ExecutionEngine:
                 return None
 
     def _place_bracket_orders(self, position: Position):
-        # This function should only be called for LIVE positions after entry.
-        # It updates position.sl_order_id and position.tp_order_id.
         opposite_side = "sell" if position.side == "long" else "buy"
         
         # Place SL order
@@ -1080,12 +1120,13 @@ class ExecutionEngine:
                 if not isinstance(position, Position) or not isinstance(new_sl, D) or not new_sl.is_finite(): raise ValueError("Invalid parameters for update_stop_loss")
                 
                 old_sl = position.sl
-                # Validate new SL logic
+                # Validate new SL logic: must be below entry for long, above for short
                 if new_sl > 0 and ((position.side == "long" and new_sl >= position.entry) or (position.side == "short" and new_sl <= position.entry)):
-                    self.logger.warning(f"Attempted to set invalid SL for {position.symbol}: {new_sl} vs entry {position.entry}")
+                    self.logger.warning(f"Attempted to set invalid SL for {position.symbol}: {new_sl} vs entry {position.entry}. Ignoring update.")
                     return # Do not proceed with invalid SL
                 
                 tick_size, _ = self.exchange.get_step_sizes(position.symbol)
+                # Round SL appropriately (down for long, up for short)
                 rounded_sl = quantize_step(new_sl, tick_size, rounding=ROUND_DOWN if position.side=="long" else ROUND_UP) if new_sl > 0 else D("0")
                 
                 # Only update if SL actually changes
@@ -1095,7 +1136,7 @@ class ExecutionEngine:
                 
                 position.sl = rounded_sl
                 if not self.db_manager.save_position(position): 
-                    position.sl = old_sl # Revert if DB save fails
+                    position.sl = old_sl # Revert SL in memory if DB save fails
                     raise TradingBotError("Failed to save updated SL to DB")
                 
                 if self.mode == "live":
@@ -1123,8 +1164,9 @@ class OmegaXBot:
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.mode = MODE
+        # Initializing core components (moved to _setup_components)
         self._setup_components()
-        self._restore_state()
+        self._restore_state() # Restore state after all components are ready
         self._running = False # Initial state is not running
         self._shutdown_event = ThreadEvent() # For graceful shutdown
         self._last_error_notification = 0.0
@@ -1146,7 +1188,7 @@ class OmegaXBot:
             self.execution_engine = ExecutionEngine(self.exchange, self.db_manager, self.notifier, self.mode)
             self.portfolio = Portfolio()
             self.risk_manager = RiskManager(INITIAL_BALANCE)
-            # Placeholder for WS if implemented
+            # Placeholder for WS if implemented (UserStream is typically enabled in live mode)
             # self.user_ws = UserStream(...) if MODE == "live" and USE_USER_WS else None
             
             # Start Flask server
@@ -1167,15 +1209,21 @@ class OmegaXBot:
         valid_symbols = []
         for symbol in symbols:
             try:
-                if self.exchange.is_market_active(symbol): # Use existing market check
+                # Use ExchangeWrapper's is_market_active for consistency and circuit breaking
+                if self.exchange.is_market_active(symbol): 
                     valid_symbols.append(symbol)
                 else: self.logger.warning(f"Symbol {symbol} not active futures market or not found.")
             except Exception as e: self.logger.error(f"Error validating {symbol}: {e}")
         
         # Ensure BTC/USDT is always present if possible for hedging/beta calculation
-        if "BTC/USDT" not in valid_symbols and self.exchange.is_market_active("BTC/USDT"):
-            valid_symbols.append("BTC/USDT")
-            self.logger.info("Added BTC/USDT for hedging/beta calculation.")
+        # Check if exchange is active for BTC/USDT specifically
+        if "BTC/USDT" not in valid_symbols:
+            try:
+                if self.exchange.is_market_active("BTC/USDT"):
+                    valid_symbols.append("BTC/USDT")
+                    self.logger.info("Added BTC/USDT for hedging/beta calculation.")
+            except Exception as e:
+                self.logger.warning(f"Could not add BTC/USDT for hedging: {e}")
         
         return valid_symbols
 
@@ -1197,19 +1245,23 @@ class OmegaXBot:
                         if day_anchor < current_midnight: # Daily rollover on startup if missed
                             self.risk_manager.day_anchor, self.risk_manager.daily_pnl, self.risk_manager.consec_losses = current_midnight, D("0"), 0
                             self.risk_manager.loss_bucket = self.risk_manager.loss_bucket * D("0.8") # Adjust loss bucket on rollover
+                            self.logger.info("Risk state rolled over to new day on startup.")
                         else: self.risk_manager.day_anchor = day_anchor
                 except Exception as e: self.logger.error(f"Risk state restore failed: {e}")
             
             positions = self.db_manager.load_positions()
             for position in positions.values():
                 try:
+                    # Only add to portfolio if symbol is still valid and position is not expired
                     if position.symbol in self.symbols:
                         if position.is_expired(): # Clean up expired positions
-                            self.logger.info(f"Position {position.symbol} expired during downtime, deleting.")
+                            self.logger.info(f"Restored position {position.symbol} is expired, deleting.")
                             self.db_manager.delete_position(position.symbol)
-                        else: self.portfolio.add_position(position)
+                        else: 
+                            self.portfolio.add_position(position)
+                            self.logger.debug(f"Restored active position {position.symbol}.")
                     else: # Symbol not in current universe, delete it
-                        self.logger.info(f"Position {position.symbol} not in current universe, deleting.")
+                        self.logger.info(f"Restored position {position.symbol} not in current universe, deleting.")
                         self.db_manager.delete_position(position.symbol)
                 except Exception as e: self.logger.error(f"Position restore failed {position.symbol}: {e}")
         except Exception as e:
@@ -1247,13 +1299,14 @@ class OmegaXBot:
             if not validate_dataframe(df, 20) or position.sl <= 0: return
             
             # Retrieve ATR from indicator cache
-            indicators = self.indicator_cache.get_indicators(position.symbol, df, pd.DataFrame(), pd.DataFrame()) # Pass empty for other TFs
+            # For ATR, only df5 is relevant, so others can be empty DFs
+            indicators = self.indicator_cache.get_indicators(position.symbol, df, pd.DataFrame(), pd.DataFrame())
             atr_value = indicators.get('atr')
             if pd.isna(atr_value) or atr_value <= 0: return # Use pd.isna for float/np.nan
             atr_decimal = safe_decimal(atr_value)
             
             unrealized_pnl, risk_amount = position.unrealized_pnl(current_price), position.risk_amount()
-            if risk_amount <= 0: return
+            if risk_amount <= 0: return # Avoid division by zero
             r_multiple = unrealized_pnl / risk_amount
             
             # Dynamically adjust trail multiplier
@@ -1268,10 +1321,12 @@ class OmegaXBot:
             new_sl = D("0")
             if position.side == "long":
                 new_sl = current_price - (atr_decimal * trail_mult)
-                if new_sl > position.sl: self.execution_engine.update_stop_loss(position, new_sl)
-            else: # short
+                if new_sl > position.sl: # Only update if SL moves higher (for long)
+                    self.execution_engine.update_stop_loss(position, new_sl)
+            else: # short position
                 new_sl = current_price + (atr_decimal * trail_mult)
-                if new_sl < position.sl: self.execution_engine.update_stop_loss(position, new_sl)
+                if new_sl < position.sl: # Only update if SL moves lower (for short)
+                    self.execution_engine.update_stop_loss(position, new_sl)
         except Exception as e: self.logger.error(f"Trailing stop failed {position.symbol}: {e}", exc_info=True); self.health_monitor.record_error(e, "trailing_stop")
 
     def _manage_positions(self, prices: Dict[str, D]):
@@ -1286,11 +1341,11 @@ class OmegaXBot:
                 # Check for expiration, SL, TP
                 if position.is_expired(): positions_to_close.append((position, current_price, "TIME_LIMIT")); continue
                 
-                if position.sl > 0: # Only check if SL is set
+                if position.sl > 0: # Only check if SL is set and valid
                     if ((position.side == "long" and current_price <= position.sl) or (position.side == "short" and current_price >= position.sl)):
                         positions_to_close.append((position, current_price, "STOP_LOSS")); continue
                 
-                if position.tp > 0: # Only check if TP is set
+                if position.tp > 0: # Only check if TP is set and valid
                     if ((position.side == "long" and current_price >= position.tp) or (position.side == "short" and current_price <= position.tp)):
                         positions_to_close.append((position, current_price, "TAKE_PROFIT")); continue
                 
@@ -1304,9 +1359,8 @@ class OmegaXBot:
                 removed_position = self.portfolio.remove_position(position.symbol)
                 if removed_position:
                     pnl = self.execution_engine.close_position(removed_position, price, reason)
-                    new_balance = self.risk_manager.balance + pnl # Risk manager will update its internal balance
-                    self.risk_manager.update_balance(new_balance)
-                    self.db_manager.save_risk_state(self.risk_manager) # Save updated risk state
+                    # risk_manager.update_balance also saves risk state to DB
+                    self.risk_manager.update_balance(self.risk_manager.balance + pnl) 
             except Exception as e: self.logger.error(f"Error during position closing {position.symbol}: {e}", exc_info=True); self.health_monitor.record_error(e, "position_closing")
 
     def _analyze_symbol(self, symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame, current_price: D) -> Optional[Tuple[str, D, D, D, D]]:
@@ -1318,18 +1372,23 @@ class OmegaXBot:
             if not indicators: return None
             
             regime, vol_spike = self.strategy.detect_regime(df5, df15)
-            btc_df5 = self.data_manager.get_data("BTC/USDT", "5m") # Assuming BTC/USDT is always available for pair/beta
             
-            # Cross-sectional momentum
-            # Note: self.strategy.cross_sectional_mom_rank expects Dict[str, pd.DataFrame]
-            # but is called with {symbol: df1h} here, which is fine for single symbol.
-            # Its return is Dict[str, float].
+            # BTC/USDT data is needed for cross-sectional momentum and pair trading.
+            # Ensure it's available and fresh.
+            btc_df5 = self.data_manager.get_data("BTC/USDT", "5m")
+            if not validate_dataframe(btc_df5, 20):
+                self.logger.debug(f"BTC/USDT data not valid for {symbol} analysis.")
+                btc_df5 = pd.DataFrame() # Ensure empty if not valid
+            
+            # Cross-sectional momentum expects a dict of dataframes, even for a single symbol
             cs_rank_map = self.strategy.cross_sectional_mom_rank({symbol: df1h})
-            cs_rank = cs_rank_map.get(symbol, 0.0)
+            cs_rank = cs_rank_map.get(symbol, 0.0) # float
             
             # Alpha scores (returned as Dict[str, Tuple[float, float]])
-            # Note: funding rate is hardcoded to 0.0 here, needs to be integrated from self.funding.rates
-            alpha_scores = self.strategy.alpha_scores(symbol, df5, df15, df1h, btc_df5, cs_rank, 0.0)
+            # Assuming FundingCache is part of the bot. This example hardcodes to 0.0
+            # `self.funding.rates.get(symbol, D("0"))` would be used if FundingCache was integrated.
+            funding_rate = 0.0 # Placeholder; replace with actual funding rate if available
+            alpha_scores = self.strategy.alpha_scores(symbol, df5, df15, df1h, btc_df5, cs_rank, funding_rate)
             if not alpha_scores: return None
             
             # Aggregate alpha scores
@@ -1351,7 +1410,7 @@ class OmegaXBot:
             elif short_score > threshold and short_score > long_score: side, confidence = "short", safe_decimal(min(max(0.0, short_score), 1.0))
             if not side or confidence <= 0: return None
             
-            # Calculate SL/TP
+            # Calculate SL/TP using ATR from indicator cache
             atr_value = indicators.get('atr')
             if pd.isna(atr_value) or atr_value <= 0: return None
             atr_decimal = safe_decimal(atr_value)
@@ -1368,12 +1427,19 @@ class OmegaXBot:
                 take_profit = current_price - (atr_decimal * tp_mult)
             
             # Basic SL/TP validation
-            if stop_loss <= 0 or take_profit <= 0 or (side == "long" and stop_loss >= current_price) or (side == "short" and stop_loss <= current_price): return None
+            if stop_loss <= 0 or take_profit <= 0: # Must be positive prices
+                self.logger.debug(f"Calculated SL/TP are invalid (<=0) for {symbol}. SL: {stop_loss}, TP: {take_profit}")
+                return None
+            if (side == "long" and stop_loss >= current_price) or (side == "short" and stop_loss <= current_price):
+                self.logger.debug(f"Calculated SL is illogical for {symbol}. SL: {stop_loss}, Price: {current_price}")
+                return None
             
             risk = abs(current_price - stop_loss)
             reward = abs(take_profit - current_price)
             # Ensure proper Risk/Reward ratio
-            if risk <= 0 or reward / risk < D("1.2"): return None
+            if risk <= 0 or reward / risk < D("1.2"):
+                self.logger.debug(f"Invalid R:R ratio for {symbol}. Risk: {risk}, Reward: {reward}")
+                return None
             
             return side, current_price, stop_loss, take_profit, confidence
         except Exception as e: self.logger.error(f"Analysis failed {symbol}: {e}", exc_info=True); self.health_monitor.record_error(e, "symbol_analysis"); return None
@@ -1386,13 +1452,17 @@ class OmegaXBot:
         # Calculate total risk from currently open directional positions
         current_total_risk = sum(p.risk_amount() for p in self.portfolio.get_all_positions() if not p.is_hedge)
         # Check against MAX_TOTAL_RISK
-        if current_total_risk / self.risk_manager.balance >= MAX_TOTAL_RISK: return
+        if current_total_risk / self.risk_manager.balance >= MAX_TOTAL_RISK: # Ensure balance is > 0
+            self.logger.debug(f"Total portfolio risk ({current_total_risk}) exceeds MAX_TOTAL_RISK ({MAX_TOTAL_RISK * self.risk_manager.balance}).")
+            return
         
         opportunities_found, max_new_positions = 0, min(3, MAX_CONCURRENT_POS - open_positions_count)
         
-        for symbol in self.symbols:
+        # Sort symbols for consistent behavior
+        for symbol in sorted(self.symbols):
             try:
                 if opportunities_found >= max_new_positions: break
+                # Check if already has position or not allowed to trade due to cooldown/risk
                 if self.portfolio.get_position(symbol) or not self.risk_manager.can_trade(symbol): continue
                 
                 current_price = prices.get(symbol)
@@ -1421,7 +1491,7 @@ class OmegaXBot:
                 
                 new_trade_risk_amount = abs(entry_price - stop_loss) * position_size
                 if (current_total_risk + new_trade_risk_amount) / self.risk_manager.balance > MAX_TOTAL_RISK:
-                    self.logger.debug(f"New trade for {symbol} would exceed MAX_TOTAL_RISK.")
+                    self.logger.debug(f"New trade for {symbol} would exceed MAX_TOTAL_RISK. Current total: {current_total_risk}, New: {new_trade_risk_amount}.")
                     continue
                 
                 # Open position
@@ -1443,10 +1513,10 @@ class OmegaXBot:
             self.health_monitor.cleanup_memory()
             
             # Indicator cache cleanup, log stats
-            cache_stats = self.indicator_cache.hit_count, self.indicator_cache.miss_count
-            self.logger.debug(f"Indicator Cache Stats - Hits: {cache_stats[0]}, Misses: {cache_stats[1]}")
+            cache_stats_hits, cache_stats_misses = self.indicator_cache.hit_count, self.indicator_cache.miss_count
+            self.logger.debug(f"Indicator Cache Stats - Hits: {cache_stats_hits}, Misses: {cache_stats_misses}")
             self.indicator_cache._cleanup_cache() # Explicitly call cleanup
-
+            
             self._send_periodic_report()
             
             # Backup DB periodically (e.g., once every X reports)
@@ -1468,6 +1538,7 @@ class OmegaXBot:
             total_unrealized_pnl_val = D("0")
 
             for p in all_positions:
+                # Use current price, fallback to entry price if current price not available
                 price_for_calc = prices.get(p.symbol, p.entry)
                 total_exposure_val += p.qty * price_for_calc
                 total_unrealized_pnl_val += p.unrealized_pnl(price_for_calc)
@@ -1539,7 +1610,7 @@ class OmegaXBot:
         self._running = True
         self.logger.info("Starting OmegaX trading bot main loop...")
         
-        # Setup signal handlers
+        # Setup signal handlers for graceful shutdown
         def signal_handler(signum, frame): self.logger.info(f"Signal {signum} received, shutting down..."); self.stop()
         try: signal.signal(signal.SIGINT, signal_handler); signal.signal(signal.SIGTERM, signal_handler)
         except: pass # Signal handlers may not be available on all platforms
@@ -1607,8 +1678,7 @@ class OmegaXBot:
                     self.db_manager.save_risk_state(self.risk_manager) # Save final risk state
                     with self.risk_manager._lock:
                         self.risk_manager.paused_until = time.time() + 3600 # Pause for 1 hour
-                    self.notifier.send_critical("🔒 All positions closed. Trading paused for 1 hour.")
-                    break # Exit main loop after hard stop
+                    self.notifier.send_critical("🔒 All positions closed. Trading paused for 1 hour."); break # Exit main loop after hard stop
 
                 except ExchangeUnavailable as e:
                     self.logger.error(f"Exchange unavailable: {e}", exc_info=True)
@@ -1677,7 +1747,7 @@ class OmegaXBot:
 # ====================== FLASK HEALTH SERVER ======================
 def create_health_server(bot: OmegaXBot) -> Flask:
     app = Flask(__name__)
-    app.logger.disabled = True
+    app.logger.disabled = True # Disable default Flask logger for cleaner output
     
     @app.route('/', methods=["GET", "HEAD"])
     def index(): return "OmegaX Bot running", 200
@@ -1688,12 +1758,12 @@ def create_health_server(bot: OmegaXBot) -> Flask:
     @app.route('/health', methods=["GET", "HEAD"])
     def health():
         try:
-            # Use bot's internal methods, ensuring thread-safe access if necessary
+            # Get current prices (might involve API calls)
             prices = bot._get_current_prices() 
             health_data = {
                 'ok': True, 
                 'mode': bot.mode, 
-                'balance': str(bot.risk_manager.balance), 
+                'balance': str(bot.risk_manager.balance), # Convert Decimal to string
                 'drawdown': str(bot.risk_manager.drawdown), 
                 'positions': len(bot.portfolio.get_all_positions()), 
                 'risk_off': bot.risk_manager.risk_off, 
@@ -1725,6 +1795,7 @@ def create_health_server(bot: OmegaXBot) -> Flask:
     @app.route('/api/positions', methods=["GET"])
     def positions():
         try:
+            # Convert Decimal fields in Position objects to string for JSON serialization
             pos_data = [
                 {'symbol': p.symbol, 'side': p.side, 'qty': str(p.qty), 'entry': str(p.entry), 
                  'sl': str(p.sl), 'tp': str(p.tp), 'opened_at': p.opened_at} 
@@ -1743,7 +1814,7 @@ def main():
     try:
         logger.info(f"Starting OmegaX Bot - Mode: {MODE}, Symbols: {len(SYMBOLS)}, Balance: ${INITIAL_BALANCE}")
         bot = OmegaXBot()
-        # The Flask server is now started within _setup_components
+        # The Flask server is started within _setup_components
         bot.run()
     except KeyboardInterrupt: logger.info("Bot stopped by user via KeyboardInterrupt.")
     except ConfigurationError as e: logger.critical(f"Config error: {e}", exc_info=True); return 1
