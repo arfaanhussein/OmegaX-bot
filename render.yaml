@@ -1,24 +1,73 @@
 services:
   - type: web
-    name: omegax-bot
-    env: python
-    plan: starter
+    name: omegax-fusion
+    env: docker
+    plan: free
+    healthCheckPath: /ping
+    dockerfilePath: Dockerfile
     autoDeploy: true
-    buildCommand: pip install -r requirements.txt
-    startCommand: python omega_x_bot.py
-    healthCheckPath: /health
     envVars:
-      - key: PORT
-        value: "10000"
-      - key: LOG_LEVEL
-        value: "INFO"
       - key: MODE
-        value: "paper"
-      - key: TELEGRAM_TOKEN
-        value: "8384498061:AAElt7HeM88jfune948IcKkysHpw1tmXrlc"
-      - key: TELEGRAM_CHAT_ID
-        value: "1040990874"
+        value: paper
+      - key: PORT
+        value: 10000
+      - key: LOG_LEVEL
+        value: INFO
+      - key: SYMBOL_AUTO_DISCOVERY
+        value: "true"
+      - key: SYMBOLS_TOP_N
+        value: "50"
+      - key: ENABLE_SCALPING
+        value: "true"
+      - key: SCALPING_MAX_SYMBOLS
+        value: "12"
+      - key: ENABLE_MEAN_REVERSION
+        value: "true"
+      - key: ENABLE_GRID
+        value: "true"
+      - key: ENABLE_ARBITRAGE
+        value: "false"
+      - key: TELEGRAM_REPORT_INTERVAL_SEC
+        value: "900"
+      # KeepAlive pings
+      - key: KEEPALIVE_URL
+        value: ""   # e.g. https://uptime.betterstack.com/api/v1/heartbeat/XXXX
+      - key: SELF_URL
+        value: ""   # e.g. https://omegax-fusion.onrender.com/ping
+      - key: KEEPALIVE_INTERVAL_SEC
+        value: "60"
+      # Remote persistence (choose one backend if desired)
+      - key: PERSIST_MODE
+        value: "both"   # local|remote|both
+      - key: REMOTE_BACKEND
+        value: ""       # s3|gist
+      # S3 (if using REMOTE_BACKEND=s3)
+      - key: AWS_ACCESS_KEY_ID
+        value: ""
+      - key: AWS_SECRET_ACCESS_KEY
+        value: ""
+      - key: AWS_REGION
+        value: ""
+      - key: S3_BUCKET
+        value: ""
+      - key: S3_KEY
+        value: "state.json"
+      - key: S3_ENDPOINT
+        value: ""   # optional
+      # GitHub Gist (if using REMOTE_BACKEND=gist)
+      - key: GITHUB_TOKEN
+        value: ""
+      - key: GIST_ID
+        value: ""
+      - key: GIST_FILENAME
+        value: "state.json"
+      # Binance keys (for live)
       - key: BINANCE_API_KEY
         value: ""
       - key: BINANCE_API_SECRET
+        value: ""
+      # Telegram (optional)
+      - key: TELEGRAM_TOKEN
+        value: ""
+      - key: TELEGRAM_CHAT_ID
         value: ""

@@ -1,9 +1,6 @@
-.env
-state.json
 __pycache__/
 *.pyc
+.env
+state.json
+venv/
 .venv/
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
