@@ -1,7 +1,7 @@
-echo "numpy==1.24.3
+numpy==1.24.3
 pandas==2.0.3
 requests==2.31.0
 ccxt==4.0.77
 Flask==2.3.2
 ta==0.10.2
-psutil==5.9.5" > requirements.txt
+psutil==5.9.5
