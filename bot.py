@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
-"""
-OmegaX Trading Bot - Compact Version (Python 3.13.4 compatible)
-All original logic preserved in condensed form
-"""
+# OmegaX Trading Bot - Compact Version (Python 3.13.4 compatible)
+# All original logic preserved in condensed form
 
 import os, time, random, logging, signal, threading, sqlite3, gc, json
 ... from threading import RLock, Event as ThreadEvent, Lock
