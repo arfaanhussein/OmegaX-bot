@@ -13,7 +13,7 @@ Highlights:
 - Fine-grained locking: separate locks for positions and risk; DB writes decoupled from locks.
 - Indicator caching: per-symbol cached features; no repeated indicator recompute in a single loop iteration.
 - Top-100 USDT futures auto-discovery by 24h volume; configurable scalping subset.
-- Unified risk across all trades (directional + recovery) with clear caps; hedge capped vs portfolio notional.
+- Unified risk across all trades (directional + recovery bounded), drawdown gates, daily-halt, cooldowns
 - KeepAlive pinger + 15m Telegram equity reports; Flask health endpoints (/ping /health /metrics /api/status /api/positions).
 
 Install:
@@ -53,11 +53,12 @@ from ta.volatility import BollingerBands, AverageTrueRange
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volume import VolumeWeightedAveragePrice
 import gc
+import sys # Added sys import for sys.exit
 
 try:
     from binance.streams import ThreadedWebsocketManager
     BINANCE_WS_AVAILABLE = True
-except Exception: # Retained original generic exception
+except Exception: # Retained original generic exception for compatibility
     BINANCE_WS_AVAILABLE = False
 
 
@@ -112,8 +113,10 @@ ENABLE_MEAN_REVERSION = os.environ.get("ENABLE_MEAN_REVERSION", "true").lower() 
 ENABLE_GRID = os.environ.get("ENABLE_GRID", "true").lower() == "true"
 ENABLE_ARBITRAGE = os.environ.get("ENABLE_ARBITRAGE", "false").lower() == "true"  # detect-only
 USE_USER_WS = os.environ.get("USE_USER_WS", "true").lower() == "true"
-SYMBOL_AUTO_DISCOVERY = os.environ.get("SYMBOL_AUTO_DISCOVERY", "true").lower() == "true"
-SYMBOLS_TOP_N = int(os.environ.get("SYMBOLS_TOP_N", "100"))
+# SYMBOL_AUTO_DISCOVERY: Explicitly set to True by default, as requested.
+SYMBOL_AUTO_DISCOVERY = os.environ.get("SYMBOL_AUTO_DISCOVERY", "true").lower() == "true" 
+# SYMBOLS_TOP_N: Set default to 50, as requested.
+SYMBOLS_TOP_N = int(os.environ.get("SYMBOLS_TOP_N", "50")) 
 SCALPING_MAX_SYMBOLS = int(os.environ.get("SCALPING_MAX_SYMBOLS", "16"))
 
 # Ensemble thresholds
@@ -162,6 +165,9 @@ KEEPALIVE_INTERVAL_SEC = int(os.environ.get("KEEPALIVE_INTERVAL_SEC", "60"))
 # Persistence
 JSON_SNAPSHOT = os.environ.get("JSON_SNAPSHOT", "state_snapshot.json")
 PERSIST_JSON_INTERVAL_SEC = int(os.environ.get("PERSIST_JSON_INTERVAL_SEC", "180"))
+
+# Web
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # --- END OF GLOBAL CONSTANTS & CONFIGURATION ---
 
@@ -407,6 +413,35 @@ class ExchangeWrapper:
     def get_step_sizes(self, symbol: str) -> Tuple[D, D]: return self._steps_cache.get(symbol, (D("0.01"), D("0.001")))
     def get_min_notional(self, symbol: str) -> D: return self._min_notional_cache.get(symbol, D("5"))
 
+    def discover_top_usdt_symbols(self, limit: int) -> List[str]:
+        try:
+            if hasattr(self.exchange, "fapiPublicGetTicker24hr"):
+                data = self._with_retries(self.exchange.fapiPublicGetTicker24hr)
+                ranked = []
+                for it in data:
+                    sym_id = it.get("symbol", "")
+                    if not sym_id.endswith("USDT"):
+                        continue
+                    sym = self.exchange.id_to_symbol(sym_id) or f"{sym_id[:-4]}/USDT"
+                    if sym not in self.exchange.markets:
+                        continue
+                    qv = float(it.get("quoteVolume") or it.get("volume") or 0)
+                    ranked.append((qv, sym))
+                ranked.sort(reverse=True)
+                syms = [s for _, s in ranked[:limit]]
+                # Apply aliases and filter for active markets
+                # Ensure is_market_active is called with the ALIASED symbol
+                final_symbols = [SYMBOL_ALIASES.get(s, s) for s in syms if s in self.exchange.markets and self.is_market_active(SYMBOL_ALIASES.get(s,s))]
+                self.logger.info(f"Discovered {len(final_symbols)} top USDT pairs by 24h volume.")
+                return final_symbols
+        except Exception as e:
+            self.logger.warning(f"Top symbols discovery failed: {e}. Falling back to SEED_SYMBOLS.")
+        
+        # Fallback to SEED_SYMBOLS, filtered and limited
+        fallback_symbols = [SYMBOL_ALIASES.get(s, s) for s in SEED_SYMBOLS if s in self.exchange.markets and self.is_market_active(SYMBOL_ALIASES.get(s,s))]
+        return fallback_symbols[:limit]
+
+
 # ====================== DATA MANAGEMENT ======================
 class DataManager:
     def __init__(self, exchange: ExchangeWrapper, symbols: List[str]):
@@ -569,7 +604,7 @@ class DatabaseManager:
                 conn.execute("""CREATE TABLE IF NOT EXISTS risk_state (id INTEGER PRIMARY KEY CHECK (id=1), balance TEXT NOT NULL CHECK (CAST(balance AS REAL) >= 0), 
                             equity_peak TEXT NOT NULL CHECK (CAST(equity_peak AS REAL) >= 0), daily_pnl TEXT NOT NULL, loss_bucket TEXT NOT NULL CHECK (CAST(loss_bucket AS REAL) >= 0), 
                             consec_losses INTEGER NOT NULL CHECK (consec_losses >= 0), paused_until REAL NOT NULL CHECK (paused_until >= 0), 
-                            risk_off_until REAL NOT NULL CHECK (risk_off_until >= 0), day_anchor INTEGER NOT NULL CHECK (day_anchor > 0), 
+                            risk_off_until REAL NOT NULL CHECK (CAST(risk_off_until AS REAL) >= 0), day_anchor INTEGER NOT NULL CHECK (day_anchor > 0), 
                             updated_at REAL NOT NULL CHECK (updated_at > 0))""")
                 conn.execute("""CREATE TABLE IF NOT EXISTS positions (symbol TEXT PRIMARY KEY, side TEXT NOT NULL CHECK (side IN ('long', 'short')), 
                             qty TEXT NOT NULL CHECK (CAST(qty AS REAL) > 0), entry TEXT NOT NULL CHECK (CAST(entry AS REAL) > 0), 
@@ -582,8 +617,10 @@ class DatabaseManager:
                 # Insert initial risk state if not exists
                 if not conn.execute("SELECT COUNT(*) FROM risk_state WHERE id=1").fetchone()[0]:
                     now, midnight_ts = time.time(), int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-                    conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (1,?,?,?,?,?,?,?,?,?)", 
-                                (str(INITIAL_BALANCE), str(INITIAL_BALANCE), '0', '0', 0, 0, 0, midnight_ts, now)) # Corrected missing fields in initial INSERT
+                    # --- START OF FIX (id=1 for INSERT) ---
+                    conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", 
+                                (1, str(INITIAL_BALANCE), str(INITIAL_BALANCE), '0', '0', 0, 0.0, 0.0, midnight_ts, now))
+                    # --- END OF FIX ---
                 conn.commit()
         except Exception as e: raise ConfigurationError(f"Database init failed: {e}")
 
@@ -622,7 +659,9 @@ class DatabaseManager:
                 try:
                     conn.execute("UPDATE risk_state SET balance=?,equity_peak=?,daily_pnl=?,loss_bucket=?,consec_losses=?,paused_until=?,risk_off_until=?,day_anchor=?,updated_at=? WHERE id=1", data)
                     if conn.total_changes == 0: # If update failed, try insert (should only happen if init failed)
+                        # --- START OF FIX (id=1 for INSERT in fallback) ---
                         conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (1,?,?,?,?,?,?,?,?,?)", data)
+                        # --- END OF FIX ---
                     conn.execute("COMMIT"); return True
                 except Exception as e: conn.execute("ROLLBACK"); raise e
         except Exception as e: self.logger.error(f"Save risk state failed: {e}"); return False
@@ -960,7 +999,9 @@ class OmegaXBot:
             self.exchange = ExchangeWrapper(self.mode)
             self.db_manager = DatabaseManager(DB_PATH)
             self.strategy = Strategy()
-            self.symbols = self._validate_symbols(SYMBOLS)
+            # --- START OF FIX (SYMBOL AUTO-DISCOVERY INTEGRATION) ---
+            self.symbols = self._validate_symbols(SYMBOLS) # This call now includes auto-discovery logic
+            # --- END OF FIX ---
             if not self.symbols: raise ConfigurationError("No valid symbols available after validation.")
             self.data_manager = DataManager(self.exchange, self.symbols)
             self.indicator_cache = IndicatorCache()
@@ -984,9 +1025,25 @@ class OmegaXBot:
             raise ConfigurationError(f"Bot setup failed: {e}")
 
 
-    def _validate_symbols(self, symbols: List[str]) -> List[str]:
+    def _validate_symbols(self, initial_symbols: List[str]) -> List[str]: # Renamed parameter for clarity
         valid_symbols = []
-        for symbol in symbols:
+        
+        # --- START OF FIX (SYMBOL AUTO-DISCOVERY LOGIC) ---
+        symbols_to_check = []
+        if SYMBOL_AUTO_DISCOVERY:
+            try:
+                discovered = self.exchange.discover_top_usdt_symbols(limit=SYMBOLS_TOP_N)
+                self.logger.info(f"Auto-discovered {len(discovered)} top USDT pairs.")
+                # Combine initial symbols with discovered, deduplicate, keeping order preference for initial
+                symbols_to_check = list(dict.fromkeys(initial_symbols + discovered)) 
+            except Exception as e:
+                self.logger.warning(f"Failed to auto-discover symbols: {e}. Falling back to initial SEED_SYMBOLS.")
+                symbols_to_check = initial_symbols # Fallback
+        else:
+            symbols_to_check = initial_symbols # Use initial explicitly defined symbols if auto-discovery is off
+        # --- END OF FIX ---
+
+        for symbol in symbols_to_check: # Iterate through the combined/validated list
             try:
                 # Use ExchangeWrapper's is_market_active for consistency and circuit breaking
                 if self.exchange.is_market_active(symbol): 
@@ -1173,7 +1230,7 @@ class OmegaXBot:
             # Aggregate alpha scores
             try:
                 long_scores = [scores[0] for scores in alpha_scores.values() if np.isfinite(scores[0])]
-                short_scores = [scores[1] for scores in alpha_scores.values() if np.isfinite(scores[1])] # Fix: was scores[0]
+                short_scores = [scores[1] for scores in alpha_scores.values() if np.isfinite(scores[1])] # Fixed: was scores[0]
                 
                 # Check if lists are empty before mean calculation
                 if not long_scores or not short_scores: return None
@@ -1603,4 +1660,4 @@ def main():
     logger.info("Bot shutdown complete.")
     return 0
 
-if __name__ == "__main__": exit(main())
+if __name__ == "__main__": sys.exit(main())
