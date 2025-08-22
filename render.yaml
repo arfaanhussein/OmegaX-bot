@@ -1,6 +1,6 @@
 services:
-  - type: worker
-    name: omegax-bot
+  - type: web
+    name: omegax-bot-web
     env: python
     plan: free
     autoDeploy: true
@@ -9,35 +9,18 @@ services:
       pip install --upgrade pip
       pip install -r requirements.txt
 
-    startCommand: python -u main.py
+    startCommand: python -u bot.py
 
     envVars:
-      # Pin Python version
       - key: PYTHON_VERSION
         value: 3.13.4
-
-      # App config (safe defaults)
       - key: MODE
         value: paper
       - key: SYMBOLS
         value: BTC/USDT,ETH/USDT
-
-      # SQLite path on ephemeral FS (free tier). Data resets on restarts/redeploys.
       - key: DB_PATH
         value: /tmp/state.db
-
-      # Optional: quieter or more verbose logs
       - key: LOG_LEVEL
         value: INFO
 
-      # Optional Telegram (set these in Render dashboard if you use them)
-      # - key: TELEGRAM_TOKEN
-      #   value: your_telegram_bot_token
-      # - key: TELEGRAM_CHAT_ID
-      #   value: your_chat_id
-
-      # Live trading keys (only if MODE=live). Set as Secrets in dashboard.
-      # - key: BINANCE_API_KEY
-      #   sync: false
-      # - key: BINANCE_API_SECRET
-      #   sync: false
+    healthCheckPath: /
