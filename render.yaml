@@ -1,39 +1,43 @@
 services:
-  - type: web
-    name: omegax-trading-bot
+  - type: worker
+    name: omegax-bot
     env: python
-    plan: starter
-    runtime: python-3.11.9
+    plan: free
+    autoDeploy: true
+
     buildCommand: |
       pip install --upgrade pip
-      pip install --no-cache-dir numpy pandas requests Flask psutil
-      pip install --no-cache-dir ccxt
-      pip install --no-cache-dir ta
-    startCommand: python bot.py
+      pip install -r requirements.txt
+
+    startCommand: python -u main.py
+
     envVars:
+      # Pin Python version
+      - key: PYTHON_VERSION
+        value: 3.13.4
+
+      # App config (safe defaults)
       - key: MODE
         value: paper
-      - key: INITIAL_BALANCE
-        value: "3000"
-      - key: RISK_PER_TRADE
-        value: "0.005"
-      - key: MAX_TOTAL_RISK
-        value: "0.06"
-      - key: MAX_CONCURRENT_POS
-        value: "8"
-      - key: MAX_DRAWDOWN
-        value: "0.08"
-      - key: HTTP_TIMEOUT
-        value: "10"
-      - key: RETRY_LIMIT
-        value: "3"
       - key: SYMBOLS
-        value: "BTC/USDT,ETH/USDT"
-      - key: PORT
-        value: "10000"
-      - key: LOG_LEVEL
-        value: "INFO"
+        value: BTC/USDT,ETH/USDT
+
+      # SQLite path on ephemeral FS (free tier). Data resets on restarts/redeploys.
       - key: DB_PATH
-        value: "/opt/render/project/src/state.db"
-    healthCheckPath: /health
-    autoDeploy: false
+        value: /tmp/state.db
+
+      # Optional: quieter or more verbose logs
+      - key: LOG_LEVEL
+        value: INFO
+
+      # Optional Telegram (set these in Render dashboard if you use them)
+      # - key: TELEGRAM_TOKEN
+      #   value: your_telegram_bot_token
+      # - key: TELEGRAM_CHAT_ID
+      #   value: your_chat_id
+
+      # Live trading keys (only if MODE=live). Set as Secrets in dashboard.
+      # - key: BINANCE_API_KEY
+      #   sync: false
+      # - key: BINANCE_API_SECRET
+      #   sync: false

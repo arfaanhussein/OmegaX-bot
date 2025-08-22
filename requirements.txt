@@ -1,7 +1,6 @@
-numpy
-pandas
-requests
-ccxt
-Flask
-ta
-psutil
+numpy>=2.2,<3.0
+pandas>=2.3,<3.0
+ccxt>=4.2,<5.0
+requests>=2.32,<3.0
+psutil>=6.0,<7.0
+ta>=0.11,<0.13
