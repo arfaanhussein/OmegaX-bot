@@ -1,11 +1,14 @@
 services:
   - type: web
     name: omegax-fusion
-    env: docker
+    runtime: python
     plan: free
+    region: oregon
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: python omegax_fusion_v23.py
     healthCheckPath: /ping
-    dockerfilePath: Dockerfile
-    autoDeploy: true
     envVars:
       - key: MODE
         value: paper
@@ -29,18 +32,18 @@ services:
         value: "false"
       - key: TELEGRAM_REPORT_INTERVAL_SEC
         value: "900"
-      # KeepAlive pings
-      - key: KEEPALIVE_URL
-        value: ""   # e.g. https://uptime.betterstack.com/api/v1/heartbeat/XXXX
+      # KeepAlive pings (optional but recommended)
       - key: SELF_URL
         value: ""   # e.g. https://omegax-fusion.onrender.com/ping
+      - key: KEEPALIVE_URL
+        value: ""   # e.g. BetterStack/UptimeRobot heartbeat URL
       - key: KEEPALIVE_INTERVAL_SEC
         value: "60"
-      # Remote persistence (choose one backend if desired)
+      # Persistence (optional, to survive redeploys)
       - key: PERSIST_MODE
-        value: "both"   # local|remote|both
+        value: "local"     # or both/remote if you configure below
       - key: REMOTE_BACKEND
-        value: ""       # s3|gist
+        value: ""          # s3|gist (set and fill below to enable)
       # S3 (if using REMOTE_BACKEND=s3)
       - key: AWS_ACCESS_KEY_ID
         value: ""
@@ -53,20 +56,20 @@ services:
       - key: S3_KEY
         value: "state.json"
       - key: S3_ENDPOINT
-        value: ""   # optional
-      # GitHub Gist (if using REMOTE_BACKEND=gist)
+        value: ""
+      # Gist (if using REMOTE_BACKEND=gist)
       - key: GITHUB_TOKEN
         value: ""
       - key: GIST_ID
         value: ""
       - key: GIST_FILENAME
         value: "state.json"
-      # Binance keys (for live)
+      # Binance keys (live only)
       - key: BINANCE_API_KEY
         value: ""
       - key: BINANCE_API_SECRET
         value: ""
-      # Telegram (optional)
+      # Telegram (recommended)
       - key: TELEGRAM_TOKEN
         value: ""
       - key: TELEGRAM_CHAT_ID
