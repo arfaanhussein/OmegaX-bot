@@ -319,9 +319,12 @@ class ExchangeWrapper:
                 # Binance Futures Testnet configuration
                 config["options"]["defaultType"] = "future"
                 # --- START OF FIX (Explicit URLs for Binance Futures Testnet, ensuring public endpoint) ---
+                # This explicitly sets both the 'api' and 'public' URLs to the Binance SPOT Testnet API
+                # This is because ccxt's load_markets for Binance often makes calls to a general 'public' endpoint,
+                # even when defaultType is 'future' and explicit futures URLs are set.
                 config["urls"] = {
-                    'public': 'https://testnet.binance.vision/api',  # General Spot Testnet Public API
-                    'api': 'https://testnet.binance.vision/api',      # Also general public API
+                    'api': 'https://testnet.binance.vision/api',      # General SPOT Testnet Public API (often used by load_markets)
+                    'public': 'https://testnet.binance.vision/api',  # Also general public API
                     'fapi': 'https://testnet.binancefuture.com/fapi/v1',   # Unified Futures API
                     'private': 'https://testnet.binancefuture.com/fapi/v1', # Private Futures API
                     'dapi': 'https://testnet.binancefuture.com/dapi/v1', # For USDⓈ-M Futures (Coin-M)
@@ -660,7 +663,7 @@ class DatabaseManager:
                     conn.execute("UPDATE risk_state SET balance=?,equity_peak=?,daily_pnl=?,loss_bucket=?,consec_losses=?,paused_until=?,risk_off_until=?,day_anchor=?,updated_at=? WHERE id=1", data)
                     if conn.total_changes == 0: # If update failed, try insert (should only happen if init failed)
                         # --- START OF FIX (id=1 for INSERT in fallback) ---
-                        conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (1,?,?,?,?,?,?,?,?,?)", data)
+                        conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (1, *data)) # Pass id=1 and unpack data
                         # --- END OF FIX ---
                     conn.execute("COMMIT"); return True
                 except Exception as e: conn.execute("ROLLBACK"); raise e
