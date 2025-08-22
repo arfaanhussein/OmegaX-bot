@@ -323,14 +323,27 @@ class ExchangeWrapper:
                 # This is because ccxt's load_markets for Binance often makes calls to a general 'public' endpoint,
                 # even when defaultType is 'future' and explicit futures URLs are set.
                 config["urls"] = {
-                    'api': 'https://testnet.binance.vision/api',      # General SPOT Testnet Public API (often used by load_markets)
-                    'public': 'https://testnet.binance.vision/api',  # Also general public API
+                    'api': 'https://testnet.binance.vision/api',      # General SPOT Testnet Public API
+                    'public': 'https://testnet.binance.vision/api',  # Also general public API for consistency
                     'fapi': 'https://testnet.binancefuture.com/fapi/v1',   # Unified Futures API
                     'private': 'https://testnet.binancefuture.com/fapi/v1', # Private Futures API
                     'dapi': 'https://testnet.binancefuture.com/dapi/v1', # For USDⓈ-M Futures (Coin-M)
                 }
+                # It's also good practice to tell ccxt it's a testnet/sandbox directly.
+                config['testnet'] = True 
                 # --- END OF FIX ---
             self.exchange = ccxt.binance(config)
+
+            # --- Additional robustness for testnet, AFTER exchange is initialized ---
+            if self.mode == "paper":
+                try:
+                    # set_sandbox_mode is available for some exchanges, ensures internal settings are correct
+                    if hasattr(self.exchange, 'set_sandbox_mode'):
+                        self.exchange.set_sandbox_mode(True)
+                except Exception as e:
+                    self.logger.warning(f"Failed to set sandbox mode explicitly: {e}")
+            # --- End additional robustness ---
+
             self.exchange.load_markets() # Load markets after config
             futures_markets = [s for s, m in self.exchange.markets.items() if m.get('type') == 'future']
             if not futures_markets: raise ConfigurationError("No futures markets found on exchange")
@@ -596,7 +609,7 @@ class IndicatorCache:
 # ====================== DATABASE MANAGER ======================
 class DatabaseManager:
     def __init__(self, db_path: str):
-        self.db_path, self.logger = db_path, logging.getLogger(self.__class__.__name__)
+        self.db_path, self.logger = logging.getLogger(self.__class__.__name__), db_path
         self._connection_pool_lock = Lock()
         self._init_database()
 
@@ -620,10 +633,8 @@ class DatabaseManager:
                 # Insert initial risk state if not exists
                 if not conn.execute("SELECT COUNT(*) FROM risk_state WHERE id=1").fetchone()[0]:
                     now, midnight_ts = time.time(), int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-                    # --- START OF FIX (id=1 for INSERT) ---
                     conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", 
                                 (1, str(INITIAL_BALANCE), str(INITIAL_BALANCE), '0', '0', 0, 0.0, 0.0, midnight_ts, now))
-                    # --- END OF FIX ---
                 conn.commit()
         except Exception as e: raise ConfigurationError(f"Database init failed: {e}")
 
@@ -662,9 +673,7 @@ class DatabaseManager:
                 try:
                     conn.execute("UPDATE risk_state SET balance=?,equity_peak=?,daily_pnl=?,loss_bucket=?,consec_losses=?,paused_until=?,risk_off_until=?,day_anchor=?,updated_at=? WHERE id=1", data)
                     if conn.total_changes == 0: # If update failed, try insert (should only happen if init failed)
-                        # --- START OF FIX (id=1 for INSERT in fallback) ---
-                        conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (1, *data)) # Pass id=1 and unpack data
-                        # --- END OF FIX ---
+                        conn.execute("INSERT INTO risk_state (id,balance,equity_peak,daily_pnl,loss_bucket,consec_losses,paused_until,risk_off_until,day_anchor,updated_at) VALUES (1,?,?,?,?,?,?,?,?,?)", data)
                     conn.execute("COMMIT"); return True
                 except Exception as e: conn.execute("ROLLBACK"); raise e
         except Exception as e: self.logger.error(f"Save risk state failed: {e}"); return False
