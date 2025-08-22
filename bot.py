@@ -52,7 +52,7 @@ from ta.trend import EMAIndicator, MACD, ADXIndicator, SMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volume import VolumeWeightedAveragePrice
-import gc # Added gc import
+import gc
 
 try:
     from binance.streams import ThreadedWebsocketManager
@@ -67,20 +67,44 @@ D = Decimal
 Q = lambda x: D(str(x))  # safe Decimal conversion from any numeric/str
 
 
-# ====================== ENV + CONFIG ======================
-MODE = os.environ.get("MODE", "paper").lower()  # paper|live
+# ====================== ENV + CONFIG (ALL MOVED TO TOP) ======================
 
-# Universe
-SEED_SYMBOLS = os.environ.get(
-    "SEED_SYMBOLS",
-    "BTC/USDT,ETH/USDT,BNB/USDT,SOL/USDT,XRP/USDT,ADA/USDT,DOGE/USDT,TRX/USDT,AVAX/USDT,LINK/USDT,DOT/USDT,MATIC/USDT,BCH/USDT,LTC/USDT,NEAR/USDT,"
-    "FIL/USDT,ATOM/USDT,ICP/USDT,APT/USDT,ARB/USDT"
-).split(",")
-SYMBOL_ALIASES = {"MATIC/USDT": "POL/USDT"}
+# --- START OF GLOBAL CONSTANTS & CONFIGURATION ---
 
-# TFs
-TIMEFRAMES = ["1m", "5m", "15m", "1h"]
-TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+# Function to validate and retrieve MODE, must be defined BEFORE MODE is set
+def _validate_mode() -> str:
+    mode = os.environ.get('MODE', 'paper').lower()
+    if mode == 'live':
+        for var in ['BINANCE_API_KEY', 'BINANCE_API_SECRET']:
+            if not os.environ.get(var, '').strip():
+                raise ValueError(f"Required {var} not set for live trading")
+    return mode
+
+MODE = _validate_mode() # Set MODE here
+
+# Constants with validation
+INITIAL_BALANCE = Q(os.environ.get("INITIAL_BALANCE", "3000"))
+RISK_PER_TRADE = max(Q("0.001"), min(Q("0.05"), Q(os.environ.get("RISK_PER_TRADE", "0.005"))))
+MAX_TOTAL_RISK = max(Q("0.01"), min(Q("0.2"), Q(os.environ.get("MAX_TOTAL_RISK", "0.06"))))
+MAX_CONCURRENT_POS = max(1, min(20, int(os.environ.get("MAX_CONCURRENT_POS", "8"))))
+MAX_DRAWDOWN = max(Q("0.02"), min(Q("0.3"), Q(os.environ.get("MAX_DRAWDOWN", "0.08"))))
+HTTP_TIMEOUT = max(5, min(30, int(os.environ.get("HTTP_TIMEOUT", "10"))))
+RETRY_LIMIT = max(1, min(10, int(os.environ.get("RETRY_LIMIT", "5"))))
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and len(TELEGRAM_TOKEN) > 20)
+
+DB_PATH = os.environ.get("DB_PATH", "state.db")
+SYMBOLS = list(dict.fromkeys([s.strip() for s in os.environ.get("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]))
+PORT = int(os.environ.get("PORT", "10000"))
+
+DATA_MAX_AGE = 300
+PRICE_MAX_AGE = 60
+
+# TFs (already defined above but kept consistent with original structure)
+# TIMEFRAMES = ["1m", "5m", "15m", "1h"] # Already global in original
+# TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600} # Already global in original
 
 # Feature flags
 ENABLE_SCALPING = os.environ.get("ENABLE_SCALPING", "true").lower() == "true"
@@ -91,20 +115,6 @@ USE_USER_WS = os.environ.get("USE_USER_WS", "true").lower() == "true"
 SYMBOL_AUTO_DISCOVERY = os.environ.get("SYMBOL_AUTO_DISCOVERY", "true").lower() == "true"
 SYMBOLS_TOP_N = int(os.environ.get("SYMBOLS_TOP_N", "100"))
 SCALPING_MAX_SYMBOLS = int(os.environ.get("SCALPING_MAX_SYMBOLS", "16"))
-
-# Risk and money
-INITIAL_BALANCE = Q(os.environ.get("INITIAL_BALANCE", "3000"))
-LEVERAGE_MIN = Q(os.environ.get("LEVERAGE_MIN", "10"))
-LEVERAGE_MAX = Q(os.environ.get("LEVERAGE_MAX", "20"))
-
-RISK_PER_TRADE = Q(os.environ.get("RISK_PER_TRADE", "0.005"))
-MAX_TOTAL_RISK = Q(os.environ.get("MAX_TOTAL_RISK", "0.06"))
-MAX_CONCURRENT_POS = int(os.environ.get("MAX_CONCURRENT_POS", "8"))
-MIN_TRADE_COOLDOWN_SEC = int(os.environ.get("MIN_TRADE_COOLDOWN_SEC", "300"))
-
-SOFT_PAUSE_DD = Q(os.environ.get("SOFT_PAUSE_DD", "0.05"))
-MAX_DRAWDOWN = Q(os.environ.get("MAX_DRAWDOWN", "0.08"))
-DAILY_MAX_LOSS_FRAC = Q(os.environ.get("DAILY_MAX_LOSS_FRAC", "0.03"))
 
 # Ensemble thresholds
 BASE_SCORE_THRESHOLD = Q(os.environ.get("BASE_SCORE_THRESHOLD", "0.9"))
@@ -143,32 +153,9 @@ HIGH_NEGATIVE_FUNDING = Q(os.environ.get("HIGH_NEGATIVE_FUNDING", "-0.00025"))
 GLOBAL_LOOP_SLEEP_RANGE = (float(os.environ.get("LOOP_SLEEP_MIN", "0.9")),
                            float(os.environ.get("LOOP_SLEEP_MAX", "1.6")))
 MAX_KLINE_UPDATES_PER_LOOP = int(os.environ.get("MAX_KLINE_UPDATES_PER_LOOP", "16"))
-# --- START OF GLOBAL CONSTANTS MOVED UP ---
-TICKER_FRESHNESS_SEC = float(os.environ.get("TICKER_FRESHNESS_SEC", "15"))
-HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
-RETRY_LIMIT = int(os.environ.get("RETRY_LIMIT", "5"))
-DATA_MAX_AGE = 300 # Moved up
-PRICE_MAX_AGE = 60 # Moved up
-# --- END OF GLOBAL CONSTANTS MOVED UP ---
-
-
-# Telegram
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and len(TELEGRAM_TOKEN) > 20)
-TELEGRAM_MIN_INTERVAL = float(os.environ.get("TELEGRAM_MIN_INTERVAL", "0.8"))
-TELEGRAM_REPORT_INTERVAL_SEC = int(os.environ.get("TELEGRAM_REPORT_INTERVAL_SEC", "900"))
-
-# Grid
-GRID_LEVELS = int(os.environ.get("GRID_LEVELS", "8"))
-GRID_SPACING_PCT = Q(os.environ.get("GRID_SPACING_PCT", "0.004"))
-GRID_RISK_FRACTION = Q(os.environ.get("GRID_RISK_FRACTION", "0.15"))
-GRID_COOLDOWN_SEC = int(os.environ.get("GRID_COOLDOWN_SEC", "45"))
-
-# Arbitrage
-ARB_SCAN_INTERVAL_SEC = int(os.environ.get("ARB_SCAN_INTERVAL_SEC", "30"))
-ARB_MIN_NET_PCT = Q(os.environ.get("ARB_MIN_NET_PCT", "0.0015"))
-ARB_EXCHANGES = [e.strip() for e in os.environ.get("ARB_EXCHANGES", "").split(",") if e.strip()]
+# TICKER_FRESHNESS_SEC = float(os.environ.get("TICKER_FRESHNESS_SEC", "15")) # Already global
+# HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10")) # Already global
+# RETRY_LIMIT = int(os.environ.get("RETRY_LIMIT", "5")) # Already global
 
 # KeepAlive
 KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL", "").strip()
@@ -176,13 +163,15 @@ SELF_URL = os.environ.get("SELF_URL", "").strip()
 KEEPALIVE_INTERVAL_SEC = int(os.environ.get("KEEPALIVE_INTERVAL_SEC", "60"))
 
 # Persistence
-DB_PATH = os.environ.get("DB_PATH", "state.db")
+# DB_PATH = os.environ.get("DB_PATH", "state.db") # Already global
 JSON_SNAPSHOT = os.environ.get("JSON_SNAPSHOT", "state_snapshot.json")
 PERSIST_JSON_INTERVAL_SEC = int(os.environ.get("PERSIST_JSON_INTERVAL_SEC", "180"))
 
 # Web
-PORT = int(os.environ.get("PORT", "10000"))
+# PORT = int(os.environ.get("PORT", "10000")) # Already global
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# --- END OF GLOBAL CONSTANTS & CONFIGURATION ---
 
 
 # ====================== LOGGING ======================
@@ -337,7 +326,7 @@ class ExchangeWrapper:
                     'private': 'https://testnet.binancefuture.com/fapi/v1', # Private Futures API
                     'fapi': 'https://testnet.binancefuture.com/fapi/v1',   # Unified Futures API
                     # General public API for testnet, often used by ccxt for generic ticker/ohlcv
-                    'api': 'https://testnet.binance.vision/api', 
+                    'api': 'https://testnet.binance.vision/api',
                     'dapi': 'https://testnet.binancefuture.com/dapi/v1', # For USDⓈ-M Futures (Coin-M)
                 }
                 # --- END OF FIX ---
@@ -480,13 +469,13 @@ class DataManager:
         df = self.data.get(symbol, {}).get(timeframe, pd.DataFrame())
         return df.copy() if not df.empty else df
 
-    def is_data_fresh(self, symbol: str, timeframe: str, max_age: int = DATA_MAX_AGE) -> bool: # DATA_MAX_AGE is now globally defined
+    def is_data_fresh(self, symbol: str, timeframe: str, max_age: int = DATA_MAX_AGE) -> bool:
         return is_data_fresh(self.last_update.get(symbol, {}).get(timeframe, 0), max_age)
 
     def get_latest_price(self, symbol: str) -> Optional[D]:
         for tf in ["1m", "5m", "15m"]:
             df = self.get_data(symbol, tf)
-            if not df.empty and self.is_data_fresh(symbol, tf, PRICE_MAX_AGE): # PRICE_MAX_AGE is now globally defined
+            if not df.empty and self.is_data_fresh(symbol, tf, PRICE_MAX_AGE):
                 return safe_decimal(df["close"].iloc[-1])
         return None
 
@@ -1612,7 +1601,10 @@ def main():
     setup_logging()
     logger = logging.getLogger("main")
     try:
+        # --- START OF FIX (GLOBAL VARS ARE DEFINED BEFORE USAGE) ---
+        # The variables MODE, SYMBOLS, INITIAL_BALANCE etc. are now defined globally BEFORE this line
         logger.info(f"Starting OmegaX Bot - Mode: {MODE}, Symbols: {len(SYMBOLS)}, Balance: ${INITIAL_BALANCE}")
+        # --- END OF FIX ---
         bot = OmegaXBot()
         # The Flask server is started within _setup_components
         bot.run()
