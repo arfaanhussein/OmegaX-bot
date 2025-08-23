@@ -14,7 +14,7 @@ services:
       - key: UPDATE_INTERVAL
         value: "25"
       - key: REPORT_INTERVAL
-        value: "1800"
+        value: "300"
       # Set these in the dashboard as secrets or here if you're okay committing them
       # - key: TELEGRAM_TOKEN
       #   value: your_token
