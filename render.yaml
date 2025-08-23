@@ -1,24 +1,22 @@
 services:
-  - type: worker
+  - type: web
     name: omegax-bot
     env: python
     plan: free
-    autoDeploy: true
-
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-
-    startCommand: python -u main.py
-
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.13.4
-      - key: MODE
-        value: paper
-      - key: SYMBOLS
-        value: BTC/USDT,ETH/USDT
-      - key: DB_PATH
-        value: /tmp/state.db
+      - key: USE_REALISTIC_PAPER
+        value: true
       - key: LOG_LEVEL
         value: INFO
+      - key: UPDATE_INTERVAL
+        value: "25"
+      - key: REPORT_INTERVAL
+        value: "1800"
+      # Set these in the dashboard as secrets or here if you're okay committing them
+      # - key: TELEGRAM_TOKEN
+      #   value: your_token
+      # - key: TELEGRAM_CHAT_ID
+      #   value: your_chat_id
