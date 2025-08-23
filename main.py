@@ -44,6 +44,11 @@ try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.cluster import KMeans
     from sklearn.ensemble import IsolationForest
+    # Suppress numpy polyfit RankWarning explicitly
+    try:
+        warnings.simplefilter('ignore', np.RankWarning)
+    except Exception:
+        pass
 except ImportError as e:
     print(f"Installing required packages: {e}")
     os.system("pip install numpy pandas scikit-learn")
@@ -52,6 +57,11 @@ except ImportError as e:
     from sklearn.preprocessing import StandardScaler
     from sklearn.cluster import KMeans
     from sklearn.ensemble import IsolationForest
+    # Suppress numpy polyfit RankWarning explicitly (post-install)
+    try:
+        warnings.simplefilter('ignore', np.RankWarning)
+    except Exception:
+        pass
 
 # Set decimal precision
 getcontext().prec = 28
@@ -252,7 +262,8 @@ class RegimeDetector:
         self.window = window
         self.observations = deque(maxlen=window)
         self.scaler = StandardScaler()
-        self.kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+        the_kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+        self.kmeans = the_kmeans
         self.fitted = False
 
     def update(self, returns, volatility, volume_ratio):
@@ -272,7 +283,7 @@ class RegimeDetector:
             if self.fitted:
                 current_obs = obs_array[-1:].reshape(1, -1)
                 scaled_current = self.scaler.transform(current_obs)
-                regime = self.kmeans.predict(scaled_current)[0]
+                _ = self.kmeans.predict(scaled_current)[0]
 
                 # Map regimes to meaningful labels
                 recent_obs = obs_array[-10:]
@@ -360,7 +371,7 @@ class BinanceClient:
 
     def _test_connection(self):
         try:
-            response = self._request('GET', '/fapi/v1/ping')
+            _ = self._request('GET', '/fapi/v1/ping')
             self.logger.info("✅ Binance API connection successful")
         except Exception as e:
             self.logger.error(f"❌ Binance API connection failed: {e}")
@@ -408,19 +419,26 @@ class BinanceClient:
             return Decimal('0')
 
     def get_positions(self) -> List[Dict]:
+        # FIX: compute percentage safely; avoid KeyError on 'percentage'
         try:
             response = self._request('GET', '/fapi/v2/positionRisk', signed=True, weight=5)
-            positions = []
+            positions: List[Dict[str, Any]] = []
             for pos in response:
-                if float(pos['positionAmt']) != 0:
+                amt = float(pos.get('positionAmt', 0))
+                if amt != 0:
+                    entry = float(pos.get('entryPrice', 0))
+                    mark = float(pos.get('markPrice', 0))
+                    pnl = float(pos.get('unRealizedProfit', 0))
+                    notional = abs(amt) * entry
+                    percentage = (pnl / notional) * 100 if notional > 0 else 0.0
                     positions.append({
-                        'symbol': pos['symbol'],
-                        'side': 'LONG' if float(pos['positionAmt']) > 0 else 'SHORT',
-                        'size': abs(float(pos['positionAmt'])),
-                        'entry_price': float(pos['entryPrice']),
-                        'mark_price': float(pos['markPrice']),
-                        'pnl': float(pos['unRealizedProfit']),
-                        'percentage': float(pos['percentage'])
+                        'symbol': pos.get('symbol', ''),
+                        'side': 'LONG' if amt > 0 else 'SHORT',
+                        'size': abs(amt),
+                        'entry_price': entry,
+                        'mark_price': mark,
+                        'pnl': pnl,
+                        'percentage': percentage
                     })
             return positions
         except Exception:
@@ -488,37 +506,50 @@ class RealisticPaperTradingClient:
             self.logger.error(f"Public API request failed: {e}")
             raise
 
+    def _get_all_prices(self) -> Dict[str, float]:
+        """Fetch all ticker prices in one call to reduce API load and avoid gaps"""
+        data = self._request('GET', '/fapi/v1/ticker/price', weight=2)
+        try:
+            return {item['symbol']: float(item['price']) for item in data}
+        except Exception:
+            # Fallback if response format unexpected
+            return {}
+
     def get_balance(self) -> Decimal:
         """Return simulated balance"""
         return self.balance
 
     def get_positions(self) -> List[Dict]:
-        """Return simulated positions with real market prices"""
-        positions = []
+        """Return simulated positions with real market prices (robust)"""
+        positions: List[Dict[str, Any]] = []
+        try:
+            prices_map = self._get_all_prices()
+        except Exception:
+            prices_map = {}
+
         for symbol, pos in self.positions.items():
-            try:
-                # Get real current price
-                ticker = self.get_ticker_price(symbol)
-                current_price = float(ticker['price'])
+            # Use live price if available, else last cached mark, else entry
+            current_price = prices_map.get(symbol, pos.get('last_mark_price', pos['entry_price']))
+            # Persist last seen price as a fallback for next time
+            self.positions[symbol]['last_mark_price'] = current_price
 
-                # Calculate real P&L
-                if pos['side'] == 'LONG':
-                    pnl = (current_price - pos['entry_price']) * pos['size']
-                else:
-                    pnl = (pos['entry_price'] - current_price) * pos['size']
+            if pos['side'] == 'LONG':
+                pnl = (current_price - pos['entry_price']) * pos['size']
+            else:
+                pnl = (pos['entry_price'] - current_price) * pos['size']
 
-                positions.append({
-                    'symbol': symbol,
-                    'side': pos['side'],
-                    'size': pos['size'],
-                    'entry_price': pos['entry_price'],
-                    'mark_price': current_price,
-                    'pnl': pnl,
-                    'percentage': (pnl / (pos['entry_price'] * pos['size'])) * 100 if pos['entry_price'] * pos['size'] > 0 else 0
-                })
-            except Exception as e:
-                self.logger.warning(f"Failed to get real price for {symbol}: {e}")
-                continue
+            notional = pos['entry_price'] * pos['size']
+            percentage = (pnl / notional) * 100 if notional > 0 else 0.0
+
+            positions.append({
+                'symbol': symbol,
+                'side': pos['side'],
+                'size': pos['size'],
+                'entry_price': pos['entry_price'],
+                'mark_price': current_price,
+                'pnl': pnl,
+                'percentage': percentage
+            })
 
         return positions
 
@@ -573,6 +604,7 @@ class RealisticPaperTradingClient:
 
                 # Update balance with P&L
                 self.balance += Decimal(str(pnl))
+                self.positions[symbol]['last_mark_price'] = execution_price
                 self.logger.info(f"💰 Closed {existing['side']} {symbol}: P&L ${pnl:.2f}")
                 del self.positions[symbol]
             else:
@@ -582,7 +614,8 @@ class RealisticPaperTradingClient:
                     'side': position_side,
                     'size': quantity,
                     'entry_price': execution_price,
-                    'timestamp': time.time()
+                    'timestamp': time.time(),
+                    'last_mark_price': execution_price
                 }
                 self.logger.info(f"🚀 Opened {position_side} {symbol}: Size {quantity} @ ${execution_price:.4f}")
 
@@ -616,7 +649,7 @@ class RealisticPaperTradingClient:
     def test_connectivity(self):
         """Test connection to Binance public API"""
         try:
-            self._request('GET', '/fapi/v1/ping')
+            _ = self._request('GET', '/fapi/v1/ping')
             self.logger.info("✅ Connected to Binance public API")
 
             # Test getting real data
@@ -702,7 +735,7 @@ class InstitutionalStrategyEngine:
             current_price = float(df['close'].iloc[-1])
             self.price_history[symbol].append(current_price)
 
-            filtered_price = self.kalman_filters[symbol].update(current_price)
+            _ = self.kalman_filters[symbol].update(current_price)
             ou_params = self.ou_models[symbol].update(current_price)
 
             if len(df) > 1:
@@ -713,7 +746,7 @@ class InstitutionalStrategyEngine:
             else:
                 regime = 'NORMAL'
 
-            return {'df': df, 'filtered_price': filtered_price, 'ou_params': ou_params, 'regime': regime, 'current_price': current_price}
+            return {'df': df, 'filtered_price': current_price, 'ou_params': ou_params, 'regime': regime, 'current_price': current_price}
         except Exception as e:
             self.logger.error(f"Failed to update market data for {symbol}: {e}")
             return None
@@ -914,11 +947,39 @@ class TradingBot:
             return self.balance
 
     def get_positions(self) -> List[Dict]:
-        """Get current positions"""
+        """Get current positions; fall back to local if client returns none"""
         try:
-            return self.binance.get_positions()
+            positions = self.binance.get_positions()
+            if positions:
+                return positions
         except Exception:
-            return list(self.positions.values())
+            pass
+
+        # Fallback: synthesize from locally tracked positions
+        synthesized: List[Dict[str, Any]] = []
+        for symbol, p in self.positions.items():
+            try:
+                ticker = self.binance.get_ticker_price(symbol)
+                current_price = float(ticker['price'])
+            except Exception:
+                current_price = p['entry_price']
+
+            pnl = (current_price - p['entry_price']) * p['size'] if p['side'] == 'LONG' \
+                else (p['entry_price'] - current_price) * p['size']
+            notional = p['entry_price'] * p['size']
+            percentage = (pnl / notional) * 100 if notional > 0 else 0.0
+
+            synthesized.append({
+                'symbol': symbol,
+                'side': p['side'],
+                'size': p['size'],
+                'entry_price': p['entry_price'],
+                'mark_price': current_price,
+                'pnl': pnl,
+                'percentage': percentage
+            })
+
+        return synthesized
 
     def calculate_position_size(self, symbol: str, entry_price: float, stop_loss: float) -> float:
         """Calculate optimal position size using risk management"""
@@ -969,7 +1030,7 @@ class TradingBot:
 
             # Place order
             side = 'BUY' if signal.side == 'LONG' else 'SELL'
-            order = self.binance.place_order(
+            _ = self.binance.place_order(
                 symbol=signal.symbol,
                 side=side,
                 order_type='MARKET',
