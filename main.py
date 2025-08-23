@@ -101,7 +101,7 @@ class Config:
     # System Configuration
     LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
     UPDATE_INTERVAL = int(os.environ.get('UPDATE_INTERVAL', '25'))  # seconds
-    REPORT_INTERVAL = int(os.environ.get('REPORT_INTERVAL', '1800'))  # 30 minutes
+    REPORT_INTERVAL = int(os.environ.get('REPORT_INTERVAL', '300'))  # 5 minutes
 
     # Rate Limiting
     MAX_REQUESTS_PER_MINUTE = int(os.environ.get('MAX_REQUESTS_PER_MINUTE', '1000'))
