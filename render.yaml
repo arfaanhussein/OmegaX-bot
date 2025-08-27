@@ -1,22 +1,15 @@
 services:
   - type: web
-    name: omegax-bot
+    name: omegax-trading-bot
     env: python
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    healthCheckPath: /
     envVars:
+      - key: PORT
+        value: 8080
+      - key: PYTHON_VERSION
+        value: 3.11.0
       - key: USE_REALISTIC_PAPER
         value: true
       - key: LOG_LEVEL
         value: INFO
-      - key: UPDATE_INTERVAL
-        value: "25"
-      - key: REPORT_INTERVAL
-        value: "300"
-      # Set these in the dashboard as secrets or here if you're okay committing them
-      # - key: TELEGRAM_TOKEN
-      #   value: your_token
-      # - key: TELEGRAM_CHAT_ID
-      #   value: your_chat_id
