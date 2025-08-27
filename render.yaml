@@ -2,13 +2,16 @@ services:
   - type: web
     name: omegax-trading-bot
     env: python
-    buildCommand: pip install -r requirements.txt
+    runtime: python-3.11.9
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: PORT
         value: 8080
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.11.9
       - key: USE_REALISTIC_PAPER
         value: true
       - key: LOG_LEVEL
