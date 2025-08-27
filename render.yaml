@@ -13,3 +13,23 @@ services:
         value: true
       - key: LOG_LEVEL
         value: INFO
+      - key: TELEGRAM_TOKEN
+        value: 7898451772:AAE7CmuD225NIFq5au6K7FUZJZwkcgSIIA4
+      - key: TELEGRAM_CHAT_ID
+        value: 1040990874
+      - key: LEVERAGE
+        value: 10
+      - key: BASE_RISK_PERCENT
+        value: 5.0
+      - key: STOP_LOSS_PERCENT
+        value: 1.2
+      - key: TAKE_PROFIT_PERCENT
+        value: 2.4
+      - key: TRAILING_TP_PERCENT
+        value: 2.0
+      - key: MAX_DRAWDOWN
+        value: 0.08
+      - key: SIGNAL_THRESHOLD
+        value: 0.70
+      - key: MAX_POSITIONS
+        value: 10
