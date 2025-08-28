@@ -17,9 +17,9 @@ services:
       - key: LOG_LEVEL
         value: INFO
       - key: TELEGRAM_TOKEN
-        value: 7898451772:AAE7CmuD225NIFq5au6K7FUZJZwkcgSIIA4
+        value: 7898451772:
       - key: TELEGRAM_CHAT_ID
-        value: 1040990874
+        value: 
       - key: LEVERAGE
         value: 10
       - key: BASE_RISK_PERCENT
