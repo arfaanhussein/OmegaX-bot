@@ -1,0 +1,11 @@
+[phases.setup] 
+providers = ["python"] 
+ 
+[phases.install] 
+cmds = ["pip install --upgrade pip", "pip install requests"] 
+ 
+[phases.build] 
+cmds = ["echo 'Build complete'"] 
+ 
+[start] 
+cmd = "python main.py" 
